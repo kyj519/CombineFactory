@@ -23,7 +23,7 @@ import shlex
 import subprocess
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -47,6 +47,7 @@ class Step:
 
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_STAGE_SELECTOR_PATTERN = re.compile(r"^s\d+$")
 
 
 def _as_list(csv_or_list: Optional[object]) -> List[str]:
@@ -319,38 +320,51 @@ def load_workflow(config_path: Path) -> Tuple[Dict[str, object], Dict[str, str],
     return settings, context, steps
 
 
+def _resolve_step_selectors(
+    steps: Dict[str, Step], selectors: List[str], *, option_name: str
+) -> Set[str]:
+    resolved: Set[str] = set()
+    for selector in selectors:
+        if selector in steps:
+            resolved.add(selector)
+            continue
+
+        if _STAGE_SELECTOR_PATTERN.match(selector):
+            prefix = f"{selector}_"
+            matches = {name for name in steps if name.startswith(prefix)}
+            if matches:
+                resolved.update(matches)
+                continue
+
+        raise ValueError(f"{option_name} includes unknown step '{selector}'")
+    return resolved
+
+
+def _restrict_steps_to_selection(steps: Dict[str, Step], selected: Set[str]) -> Dict[str, Step]:
+    restricted: Dict[str, Step] = {}
+    for name, step in steps.items():
+        if name not in selected:
+            continue
+        internal_needs = [dep for dep in step.needs if dep in selected]
+        restricted[name] = replace(step, needs=internal_needs)
+    return restricted
+
+
 def filter_steps(steps: Dict[str, Step], only: List[str], skip: List[str]) -> Dict[str, Step]:
-    skip_set = set(skip)
-    for name in skip_set:
-        if name not in steps:
-            raise ValueError(f"--skip includes unknown step '{name}'")
+    skip_set = _resolve_step_selectors(steps, skip, option_name="--skip")
 
     active = {k: v for k, v in steps.items() if k not in skip_set}
 
     if only:
-        only_set = set(only)
-        for name in only_set:
-            if name not in steps:
-                raise ValueError(f"--only includes unknown step '{name}'")
-            if name in skip_set:
-                raise ValueError(f"Step '{name}' is in both --only and --skip")
-
-        required: Set[str] = set()
-        stack = list(only_set)
-        while stack:
-            cur = stack.pop()
-            if cur in required:
-                continue
-            required.add(cur)
-            stack.extend(steps[cur].needs)
-
-        missing = required - set(active.keys())
-        if missing:
+        only_set = _resolve_step_selectors(steps, only, option_name="--only")
+        overlap = sorted(only_set & skip_set)
+        if overlap:
             raise ValueError(
-                "Selected steps require skipped steps: " + ", ".join(sorted(missing))
+                "Selected steps are in both --only and --skip: " + ", ".join(overlap)
             )
 
-        active = {k: v for k, v in active.items() if k in required}
+        active = _restrict_steps_to_selection(active, only_set)
+        return active
 
     for step in active.values():
         for dep in step.needs:
@@ -670,12 +684,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--only",
         default="",
-        help="Comma-separated step names to run (deps auto-included)",
+        help="Comma-separated step names or stage selectors (for example: s50) to run without auto-including external dependencies",
     )
     p.add_argument(
         "--skip",
         default="",
-        help="Comma-separated step names to skip",
+        help="Comma-separated step names or stage selectors (for example: s50) to skip",
     )
     return p
 

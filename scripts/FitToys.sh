@@ -1,7 +1,7 @@
 #!/bin/bash
-
-if [[ $# -lt 4 ]]; then
-  echo "Usage: $0 <seed> <injection> <rmin> <rmax>" >&2
+# 5번 인자(ORIG_DIR)까지 체크하도록 수정
+if [[ $# -lt 5 ]]; then
+  echo "Usage: $0 <seed> <injection> <rmin> <rmax> <orig_dir> [freeze_params]" >&2
   exit 2
 fi
 
@@ -34,20 +34,26 @@ cd toys_Injec${injection_str}
 echo `pwd`
 args=(
   -M FitDiagnostics
+  #--algo singles
   --datacard="../morphedWorkspace_fitDiagnostics120.root"
   --toysFile="higgsCombine.Injec${injection_str}.GenerateOnly.mH120.${seed}.root"
   --toysFrequentist
-  -t 10
+  -s "${seed}"
+  -t 5
   -m 120
   -n "${injection_str}.FitToys.${seed}"
   --cminDefaultMinimizerStrategy 0
   --robustFit 1
   --cminFallbackAlgo "Minuit2,Simplex,0:0.1"
-  --robustHesse 1
+  --minos poi
   --rMin="${rmin}"
   --rMax="${rmax}"
   --skipBOnlyFit
   --setParameters "r=${injection},rgx{mask_Signal_.*}=0"
+  #--X-rtd MINIMIZER_MaxCalls=9999999
+  --X-rtd FAST_VERTICAL_MORPH
+  #--cminDefaultMinimizerTolerance 0.05
+  #-v 1
  )
 if [[ -n "$freeze_params" ]]; then
   args+=( --freezeParameters "$freeze_params" )

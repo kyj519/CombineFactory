@@ -1,0 +1,1032 @@
+meta:
+  analysis: WtoCB
+  outdir: .
+  aux_shapes: /data6/Users/yeonjoon/combine/CMSSW_14_1_0_pre4/src/CombineFactory/RunIIVcb/BTag_DL_LLVeto_SL_LLVeto_5f/iter_prefit_ws/prefit_sl_draw_all_masked_CvsB_Subleading_Jet
+  automcstats: 10
+  out_root_prefix: Vcb_Template
+toggles:
+  dd_mode: true
+  btag_only: true
+  symmetrized: false
+  separate_dps: false
+  use_4fs_scheme: false
+definitions:
+- name: dl
+  eras:
+  - '2018'
+  - '2017'
+  - 2016preVFP
+  - 2016postVFP
+  channels:
+  - MM
+  - EE
+  - ME
+  categories:
+  - id: 1
+    name: Control_DL
+  variable: BvsC_3rd_4th_Jets_Unrolled
+  process_base_bkg: dl_default
+  process_signal: signal
+  shape_file: '{aux}/Vcb_DL_Histos_{era}_{channel}_processed.root'
+- name: sl
+  eras:
+  - '2018'
+  - '2017'
+  - 2016preVFP
+  - 2016postVFP
+  channels:
+  - Mu
+  - El
+  categories:
+  - id: 2
+    name: Control
+  - id: 3
+    name: Signal
+  variable: CvsB_Subleading_Jet
+  process_base_bkg: sl_default
+  process_signal: signal
+  shape_file: '{aux}/Vcb_Histos_{era}_{channel}_processed.root'
+process_sets:
+  signal:
+  - WtoCB
+  ttbar_base:
+  - JJ_TTLJ_2
+  - BB_TTLJ_2
+  - CC_TTLJ_2
+  - JJ_TTLL
+  - BB_TTLL
+  - CC_TTLL
+  - JJ_TTLJ_4
+  - BB_TTLJ_4
+  - CC_TTLJ_4
+  non_ttbar:
+  - Others
+  - ST
+  all_tt:
+  - '@ttbar_base'
+  - WtoCB
+  dl_default:
+  - JJ_TTLJ_2
+  - BB_TTLJ_2
+  - CC_TTLJ_2
+  - JJ_TTLL
+  - BB_TTLL
+  - CC_TTLL
+  - JJ_TTLJ_4
+  - BB_TTLJ_4
+  - CC_TTLJ_4
+  - Others
+  - ST
+  sl_default:
+  - JJ_TTLJ_2
+  - BB_TTLJ_2
+  - CC_TTLJ_2
+  - JJ_TTLL
+  - BB_TTLL
+  - CC_TTLL
+  - JJ_TTLJ_4
+  - BB_TTLJ_4
+  - CC_TTLJ_4
+  - Others
+  - ST
+  rules:
+  - match:
+      region: sl
+      channel: Mu
+    add:
+    - QCD_Data_Driven
+  - match:
+      region: sl
+      channel: El
+    add:
+    - QCD_Data_Driven
+variables:
+  dl: BvsC_3rd_4th_Jets_Unrolled
+  sl: CvsB_Subleading_Jet
+shapes:
+- region: dl
+  era: '@axes.era'
+  channel: '@axes.channel_dl'
+  category: '@categories.dl'
+  file: '{aux}/Vcb_DL_Histos_{era}_{channel}_processed.root'
+  nominal: '{category}/Nominal/$PROCESS/{var}'
+  syst: '{category}/$SYSTEMATIC/$PROCESS/{var}'
+- region: sl
+  era: '@axes.era'
+  channel: '@axes.channel_sl'
+  category: '@categories.sl'
+  file: '{aux}/Vcb_Histos_{era}_{channel}_processed.root'
+  nominal: '{category}/Nominal/$PROCESS/{var}'
+  syst: '{category}/$SYSTEMATIC/$PROCESS/{var}'
+systematics:
+- name: ttxsec_
+  type: lnN
+  value: 1.052
+  group: theory
+  select:
+    process_set: all_tt
+- name: lumi_13TeV_1516_l
+  type: lnN
+  group: experimental
+  map_era:
+    2016preVFP: 1.0118
+    2016postVFP: 1.0118
+- name: lumi_13TeV_151617_l
+  type: lnN
+  group: experimental
+  map_era:
+    2016preVFP: 1.0004
+    2016postVFP: 1.0004
+    '2017': 1.0055
+- name: lumi_13TeV_15161718_l
+  type: lnN
+  group: experimental
+  map_era:
+    2016preVFP: 1.0035
+    2016postVFP: 1.0035
+    '2017': 1.0061
+    '2018': 1.0084
+- name: Prefire_$ERA_
+  type: shape
+  value: 1.0
+  group: experimental
+- name: Pileup_
+  type: shape
+  value: 1.0
+  group: experimental
+- name: PU_Jet_Veto_$ERA_
+  type: shape
+  value: 1.0
+  group: experimental
+- name: Mu_Trig_$ERA_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - MM
+    - ME
+    - Mu
+- name: El_Trig_$ERA_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - EE
+    - ME
+    - El
+- name: Mu_Id_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - MM
+    - ME
+    - Mu
+- name: Mu_Iso_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - MM
+    - ME
+    - Mu
+- name: El_Id_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - EE
+    - ME
+    - El
+- name: El_Reco_
+  type: shape
+  value: 1.0
+  group: experimental
+  select:
+    channel_in:
+    - EE
+    - ME
+    - El
+- name: Jet_En_Absolute2016_
+  type: shape
+  group: experimental
+  map_era:
+    2016preVFP: 1.0
+    2016postVFP: 1.0
+- name: Jet_En_Absolute2017_
+  type: shape
+  group: experimental
+  map_era:
+    '2017': 1.0
+- name: Jet_En_Absolute2018_
+  type: shape
+  group: experimental
+  map_era:
+    '2018': 1.0
+- name: Jet_En_Absolute_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_BBEC12016_
+  type: shape
+  group: experimental
+  map_era:
+    2016preVFP: 1.0
+    2016postVFP: 1.0
+- name: Jet_En_BBEC12017_
+  type: shape
+  group: experimental
+  map_era:
+    '2017': 1.0
+- name: Jet_En_BBEC12018_
+  type: shape
+  group: experimental
+  map_era:
+    '2018': 1.0
+- name: Jet_En_BBEC1_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_EC22016_
+  type: shape
+  group: experimental
+  map_era:
+    2016preVFP: 1.0
+    2016postVFP: 1.0
+- name: Jet_En_EC22017_
+  type: shape
+  group: experimental
+  map_era:
+    '2017': 1.0
+- name: Jet_En_EC22018_
+  type: shape
+  group: experimental
+  map_era:
+    '2018': 1.0
+- name: Jet_En_EC2_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_FlavorQCD_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_HF2016_
+  type: shape
+  group: experimental
+  map_era:
+    2016preVFP: 1.0
+    2016postVFP: 1.0
+- name: Jet_En_HF2017_
+  type: shape
+  group: experimental
+  map_era:
+    '2017': 1.0
+- name: Jet_En_HF2018_
+  type: shape
+  group: experimental
+  map_era:
+    '2018': 1.0
+- name: Jet_En_HF_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_RelativeBal_
+  type: shape
+  group: experimental
+  value: 1.0
+- name: Jet_En_RelativeSample2016_
+  type: shape
+  group: experimental
+  map_era:
+    2016preVFP: 1.0
+    2016postVFP: 1.0
+- name: Jet_En_RelativeSample2017_
+  type: shape
+  group: experimental
+  map_era:
+    '2017': 1.0
+- name: Jet_En_RelativeSample2018_
+  type: shape
+  group: experimental
+  map_era:
+    '2018': 1.0
+- name: Jet_Res_$ERA_
+  type: shape
+  value: 1.0
+  group: experimental
+- name: B_Tag_LFStats1_$ERA_
+  type: shape
+  value: 1.0
+  group: flav_tagging
+  when:
+    btag_only: true
+- name: B_Tag_LFStats2_$ERA_
+  type: shape
+  value: 1.0
+  group: flav_tagging
+  when:
+    btag_only: true
+- name: B_Tag_HFStats1_$ERA_
+  type: shape
+  value: 1.0
+  group: flav_tagging
+  when:
+    btag_only: true
+- name: B_Tag_HFStats2_$ERA_
+  type: shape
+  value: 1.0
+  group: flav_tagging
+  when:
+    btag_only: true
+- name: B_Tag_CFErr1_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: true
+- name: B_Tag_CFErr2_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: true
+- name: B_Tag_HF_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: true
+- name: B_Tag_LF_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: true
+- name: C_Tag_Extrap_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: false
+- name: C_Tag_Interp_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: false
+- name: C_Tag_XSec_Br_Unc_DYJets_B_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: false
+- name: C_Tag_XSec_Br_Unc_DYJets_C_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: false
+- name: C_Tag_XSec_Br_Unc_WJets_C_
+  type: shape
+  group: flav_tagging
+  value: 1.0
+  when:
+    btag_only: false
+- name: C_Tag_Stat_$ERA_
+  type: shape
+  value: 1.0
+  group: flav_tagging
+  when:
+    btag_only: false
+- name: PDF_As_
+  type: shape
+  group: theory
+  value: 1.0
+- name: PDF_Error_Set_
+  type: shape
+  group: theory
+  value: 1.0
+- name: MuR_TT_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: MuF_TT_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: MuR_ST_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_in:
+    - ST
+- name: MuF_ST_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_in:
+    - ST
+- name: FSR_
+  type: shape
+  group: theory
+  value: 1.0
+- name: ISR_TT_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: ISR_ST_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_in:
+    - ST
+- name: UE_$ERA_
+  type: shape
+  group: theory
+  value: 1.0
+- name: CP5_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: hdamp_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: Top_Pt_MVA_Reweight_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: mtop_
+  type: shape
+  value: 1.0
+  group: theory
+  select:
+    process_set: all_tt
+- name: bbDPSNorm_
+  type: lnN
+  value: 1.5
+  group: theory
+  when:
+    separate_dps: true
+  select:
+    process_in:
+    - BB_TTLJ_DPS_2
+    - BB_TTLJ_DPS_4
+    - BB_TTLL_DPS
+- name: ttVNorm_
+  type: lnN
+  group: theory
+  value: 1.2
+  select:
+    process_in:
+    - ttV
+- name: VVNorm_
+  type: lnN
+  group: theory
+  value: 1.2
+  select:
+    process_in:
+    - VV
+- name: DYJetsNorm_
+  type: lnN
+  group: theory
+  value: 1.2
+  select:
+    process_in:
+    - DYJets
+- name: VJetsNorm_
+  type: lnN
+  group: theory
+  value: 1.05
+  select:
+    process_in:
+    - VJets
+- name: B_Frag_MVA_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_set: all_tt
+- name: CR1_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_set: all_tt
+- name: CR2_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_set: all_tt
+- name: erdOn_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_set: all_tt
+- name: TTBB_5FS_VS_4FS_
+  type: shape
+  value: 1.0
+  group: theory
+  when:
+    use_4fs_scheme: false
+  select:
+    process_set: ttbar
+- name: ttZNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: ttWNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: ttHNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: VVNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: WJetsNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: DYJetsNorm_
+  type: shape
+  group: theory
+  value: 1.0
+  select:
+    process_in:
+    - Others
+- name: QCD_Data_Driven_Norm_Mu_2016_
+  type: lnN
+  group: experimental
+  map_era:
+    2016preVFP: 2.0
+    2016postVFP: 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - Mu
+- name: QCD_Data_Driven_Norm_El_2016_
+  type: lnN
+  group: experimental
+  map_era:
+    2016preVFP: 2.0
+    2016postVFP: 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - El
+- name: QCD_Data_Driven_Norm_Mu_2017_
+  type: lnN
+  group: experimental
+  map_era:
+    '2017': 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - Mu
+- name: QCD_Data_Driven_Norm_El_2017_
+  type: lnN
+  group: experimental
+  map_era:
+    '2017': 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - El
+- name: QCD_Data_Driven_Norm_Mu_2018_
+  type: lnN
+  group: experimental
+  map_era:
+    '2018': 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - Mu
+- name: QCD_Data_Driven_Norm_El_2018_
+  type: lnN
+  group: experimental
+  map_era:
+    '2018': 2.0
+  select:
+    process_in:
+    - QCD_Data_Driven
+    channel_in:
+    - El
+generators:
+- kind: grid_syst
+  enabled:
+    toggle: dd_mode
+    equals: true
+  process: Others
+  name_template: QCD_TF_Eta_Bin{eta}_Pt_Bin{pt}_$ERA_$CHANNEL_
+  type: shape
+  value: 1.0
+  group: experimental
+  grid:
+    era:
+    - 2016preVFP
+    - 2016postVFP
+    - '2017'
+    - '2018'
+    channel:
+    - Mu
+    - El
+    eta:
+    - 0
+    pt:
+    - 0
+    - 1
+    - 2
+finalize:
+- kind: append_lines
+  enabled: true
+  group: experimental
+  lines:
+  - ttbbXsec rateParam * BB_* 1.0
+  - ttccXsec rateParam * CC_* 1.0
+- kind: append_lines
+  enabled: false
+  channels:
+  - Mu
+  - El
+  group: experimental
+  lines:
+  - QCD_Data_Driven_Norm rateParam * QCD_Data_Driven 1.0 [0.0,10.0]
+- kind: append_lines
+  enabled:
+    toggle: use_4fs_scheme
+    equals: false
+  group: theory
+  lines:
+  - ttbbXsec param 1.36 0.243
+  - ttccXsec param 1.11 0.212
+- kind: append_lines
+  enabled:
+    toggle: use_4fs_scheme
+    equals: false
+  lines:
+  - ttjjXsec rateParam * JJ_* (453.63-@0*10.45013377-@1*35.08476781)/(453.63-10.45013377-35.08476781)
+    ttbbXsec,ttccXsec
+- kind: append_lines
+  enabled:
+    toggle: use_4fs_scheme
+    equals: true
+  group: theory
+  lines:
+  - ttbbXsec param 1.0 0.243
+  - ttccXsec param 1.11 0.212
+  - ttjjXsec rateParam * JJ_* (453.63-@0*11.88129415-@1*35.08476781)/(453.63-11.88129415-35.08476781)
+    ttbbXsec,ttccXsec
+renaming:
+  enabled: true
+  master_file: /data6/Users/yeonjoon/combine/CMSSW_14_1_0_pre4/src/CombineFactory/RunIIVcb/BTag_DL_LLVeto_SL_LLVeto_5f/systematics_master.yml
+  strict_master_validation: true
+  check_names_output: ./systematics_TOP26001.yml
+  rules:
+  - from: lumi_13TeV_1516_l
+    to: lumi_13TeV_1516_l
+    check_names:
+      description: legacy luminosity uncertainty correlated across the 2016 preVFP
+        and postVFP data-taking periods.
+  - from: lumi_13TeV_151617_l
+    to: lumi_13TeV_151617_l
+    check_names:
+      description: legacy luminosity uncertainty correlated across the 2016 preVFP,
+        2016 postVFP, and 2017 data-taking periods.
+  - from: lumi_13TeV_15161718_l
+    to: lumi_13TeV_15161718_l
+    check_names:
+      description: legacy luminosity uncertainty correlated across the full 2016-2018
+        Run 2 data-taking periods.
+  - from: Prefire_2016preVFP_
+    to: CMS_l1_ecal_prefiring_2016
+    official_ref: CMS_l1_ecal_prefiring_2016
+  - from: Prefire_2016postVFP_
+    to: CMS_l1_ecal_prefiring_2016
+    official_ref: CMS_l1_ecal_prefiring_2016
+  - from: Prefire_2017_
+    to: CMS_l1_ecal_prefiring_2017
+    official_ref: CMS_l1_ecal_prefiring_2017
+  - from: Prefire_2018_
+    to: CMS_l1_ecal_prefiring_2018
+    check_names:
+      description: analysis-specific prefiring uncertainty retained for the 2018 templates.
+  - from: Pileup_
+    to: CMS_pileup
+    official_ref: CMS_pileup
+  - from: PU_Jet_Veto_{ERA}_
+    to: CMS_eff_j_PUJetID_eff_{ERA}
+    official_ref: CMS_eff_j_PUJetID_eff_(2016preVFP|2016postVFP|2017|2018)
+  - from: Mu_Trig_2016preVFP_
+    to: CMS_eff_m_trigger_2016
+    official_ref: CMS_eff_m_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Mu_Trig_2016postVFP_
+    to: CMS_eff_m_trigger_2016
+    official_ref: CMS_eff_m_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Mu_Trig_2017_
+    to: CMS_eff_m_trigger_2017
+    official_ref: CMS_eff_m_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Mu_Trig_2018_
+    to: CMS_eff_m_trigger_2018
+    official_ref: CMS_eff_m_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Mu_Id_
+    to: CMS_eff_m_id_total
+    official_ref: CMS_eff_m_id_total
+  - from: Mu_Iso_
+    to: CMS_eff_m_iso_total
+    official_ref: CMS_eff_m_iso_total
+  - from: El_Trig_2016preVFP_
+    to: CMS_eff_e_trigger_2016
+    official_ref: CMS_eff_e_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: El_Trig_2016postVFP_
+    to: CMS_eff_e_trigger_2016
+    official_ref: CMS_eff_e_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: El_Trig_2017_
+    to: CMS_eff_e_trigger_2017
+    official_ref: CMS_eff_e_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: El_Trig_2018_
+    to: CMS_eff_e_trigger_2018
+    official_ref: CMS_eff_e_trigger_(2016|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: El_Id_
+    to: CMS_eff_e_id
+    official_ref: CMS_eff_e_id
+  - from: El_Reco_
+    to: CMS_eff_e_reco
+    official_ref: CMS_eff_e_reco
+  - from: Jet_En_Absolute_
+    to: CMS_scale_j_Absolute
+    official_ref: CMS_scale_j_Absolute
+  - from: Jet_En_Absolute2016_
+    to: CMS_scale_j_Absolute_2016
+    official_ref: CMS_scale_j_Absolute_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_Absolute2017_
+    to: CMS_scale_j_Absolute_2017
+    official_ref: CMS_scale_j_Absolute_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_Absolute2018_
+    to: CMS_scale_j_Absolute_2018
+    official_ref: CMS_scale_j_Absolute_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_BBEC1_
+    to: CMS_scale_j_BBEC1
+    official_ref: CMS_scale_j_BBEC1
+  - from: Jet_En_BBEC12016_
+    to: CMS_scale_j_BBEC1_2016
+    official_ref: CMS_scale_j_BBEC1_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_BBEC12017_
+    to: CMS_scale_j_BBEC1_2017
+    official_ref: CMS_scale_j_BBEC1_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_BBEC12018_
+    to: CMS_scale_j_BBEC1_2018
+    official_ref: CMS_scale_j_BBEC1_(2016|2017|2018|2022|2022EE|2023|2023BPix|2024|2025)
+  - from: Jet_En_EC2_
+    to: CMS_scale_j_EC2
+  - from: Jet_En_EC22016_
+    to: CMS_scale_j_EC2_2016
+  - from: Jet_En_EC22017_
+    to: CMS_scale_j_EC2_2017
+  - from: Jet_En_EC22018_
+    to: CMS_scale_j_EC2_2018
+  - from: Jet_En_HF_
+    to: CMS_scale_j_HF
+  - from: Jet_En_HF2016_
+    to: CMS_scale_j_HF_2016
+  - from: Jet_En_HF2017_
+    to: CMS_scale_j_HF_2017
+  - from: Jet_En_HF2018_
+    to: CMS_scale_j_HF_2018
+  - from: Jet_En_FlavorQCD_
+    to: CMS_scale_j_FlavorQCD
+    official_ref: CMS_scale_j_FlavorQCD
+  - from: Jet_En_RelativeBal_
+    to: CMS_scale_j_RelativeBal
+    official_ref: CMS_scale_j_RelativeBal
+  - from: Jet_En_RelativeSample2016_
+    to: CMS_scale_j_RelativeSample_2016
+    official_ref: CMS_scale_j_RelativeSample_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_En_RelativeSample2017_
+    to: CMS_scale_j_RelativeSample_2017
+    official_ref: CMS_scale_j_RelativeSample_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_En_RelativeSample2018_
+    to: CMS_scale_j_RelativeSample_2018
+    official_ref: CMS_scale_j_RelativeSample_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_Res_2016preVFP_
+    to: CMS_res_j_2016preVFP
+    official_ref: CMS_res_j_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_Res_2016postVFP_
+    to: CMS_res_j_2016postVFP
+    official_ref: CMS_res_j_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_Res_2017_
+    to: CMS_res_j_2017
+    official_ref: CMS_res_j_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: Jet_Res_2018_
+    to: CMS_res_j_2018
+    official_ref: CMS_res_j_(2016|2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: B_Tag_CFErr1_
+    to: CMS_btag_fullShape_cferr1
+    official_ref: CMS_btag_fullShape_cferr[12]
+  - from: B_Tag_CFErr2_
+    to: CMS_btag_fullShape_cferr2
+    official_ref: CMS_btag_fullShape_cferr[12]
+  - from: B_Tag_HF_
+    to: CMS_btag_fullShape_hf
+    official_ref: CMS_btag_fullShape_hf
+  - from: B_Tag_LF_
+    to: CMS_btag_fullShape_lf
+    official_ref: CMS_btag_fullShape_lf
+  - from: B_Tag_HFStats1_{ERA}_
+    to: CMS_btag_fullShape_hfstats1_{ERA}
+    official_ref: CMS_btag_fullShape_hfstats1_(2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: B_Tag_HFStats2_{ERA}_
+    to: CMS_btag_fullShape_hfstats2_{ERA}
+    official_ref: CMS_btag_fullShape_hfstats2_(2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: B_Tag_LFStats1_{ERA}_
+    to: CMS_btag_fullShape_lfstats1_{ERA}
+    official_ref: CMS_btag_fullShape_lfstats1_(2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: B_Tag_LFStats2_{ERA}_
+    to: CMS_btag_fullShape_lfstats2_{ERA}
+    official_ref: CMS_btag_fullShape_lfstats2_(2016preVFP|2016postVFP|2017|2018|2022|2022EE|2023|2023BPix)
+  - from: C_Tag_Extrap_
+    to: CMS_ctag_fullShape_Extrap
+    official_ref: CMS_ctag_fullShape_Extrap
+  - from: C_Tag_Interp_
+    to: CMS_ctag_fullShape_Interp
+    official_ref: CMS_ctag_fullShape_Interp
+  - from: C_Tag_XSec_Br_Unc_DYJets_B_
+    to: CMS_ctag_fullShape_XSec_BRUnc_DYJets_b
+    official_ref: CMS_ctag_fullShape_XSec_BRUnc_DYJets_b
+  - from: C_Tag_XSec_Br_Unc_DYJets_C_
+    to: CMS_ctag_fullShape_XSec_BRUnc_DYJets_c
+    official_ref: CMS_ctag_fullShape_XSec_BRUnc_DYJets_c
+  - from: C_Tag_XSec_Br_Unc_WJets_C_
+    to: CMS_ctag_fullShape_XSec_BRUnc_WJets_c
+    official_ref: CMS_ctag_fullShape_XSec_BRUnc_WJets_c
+  - from: C_Tag_Stat_{ERA}_
+    to: CMS_ctag_fullShape_uncorrelated_{ERA}
+    official_ref: CMS_ctag_fullShape_uncorrelated_(2016preVFP|2016postVFP|2017|2018)
+  - from: FSR_
+    to: ps_fsr
+    official_ref: ps_fsr
+  - from: ISR_TT_
+    to: ps_isr_ttbar
+    official_ref: ps_isr_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: CR1_
+    to: ps_CR1_ttbar
+  - from: CR2_
+    to: ps_CR2_ttbar
+  - from: hdamp_
+    to: ps_hdamp
+  - from: MuR_TT_
+    to: QCDscale_ren_ttbar
+    official_ref: QCDscale_ren_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: MuF_TT_
+    to: QCDscale_fac_ttbar
+    official_ref: QCDscale_fac_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: ISR_ST_
+    to: CMS_TOP26001_ps_isr_ST
+    check_names:
+      description: parton shower initial-state radiation uncertainty for single-top
+        production.
+  - from: MuR_ST_
+    to: CMS_TOP26001_QCDscale_ren_ST
+    check_names:
+      description: uncertainty from variation of the QCD renormalization scale in
+        single-top production.
+  - from: MuF_ST_
+    to: CMS_TOP26001_QCDscale_fac_ST
+    official_ref: QCDscale_fac_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+    check_names:
+      description: uncertainty from variation of the QCD factorization scale in single-top
+        production.
+  - from: PDF_As_
+    to: pdf_alphas
+    official_ref: pdf_alphas
+  - from: PDF_Error_Set_
+    to: pdf_error_set_eveloped_
+    check_names:
+      description: envelope uncertainty from the PDF error-set variations.
+  - from: UE_2016preVFP_
+    to: underlying_event
+  - from: UE_2016postVFP_
+    to: underlying_event
+  - from: UE_2017_
+    to: underlying_event
+  - from: UE_2018_
+    to: underlying_event
+  - from: Top_Pt_MVA_Reweight_
+    to: top_pt_reweighting
+    official_ref: top_pt_reweighting
+  - from: CP5_
+    to: CMS_TOP26001_mc_tune_CP5
+    check_names:
+      description: uncertainty from the CP5 parton-shower tune variation.
+  - from: mtop_
+    to: CMS_TOP26001_topmass
+    check_names:
+      description: uncertainty from the top-quark mass variation.
+  - from: erdOn_
+    to: CMS_TOP26001_erdOn
+    check_names:
+      description: uncertainty from enabling the early resonance decay parton-shower
+        variation.
+  - from: B_Frag_MVA_
+    to: CMS_TOP26001_bfragmentation
+    check_names:
+      description: uncertainty from the b-fragmentation modelling variation.
+  - from: TTBB_5FS_VS_4FS_
+    to: CMS_TOP26001_ttbb_5FS_vs_4FS
+    check_names:
+      description: uncertainty from the ttbb modelling difference between the 5FS
+        and 4FS schemes.
+  - from: ttxsec_
+    to: cross_section_ttbar
+    official_ref: cross_section_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: VVNorm_
+    to: cross_section_VV
+    official_ref: cross_section_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: ttHNorm_
+    to: cross_section_ttH
+    official_ref: cross_section_(ttbar|V|Vgamma|VV|WW|VVV|ggH|qqH|VH|ttH|bbH|ggVV|ggWW)
+  - from: ttZNorm_
+    to: CMS_TOP26001_cross_section_ttZ
+    check_names:
+      description: normalization uncertainty for ttZ production.
+  - from: ttWNorm_
+    to: CMS_TOP26001_cross_section_ttW
+    check_names:
+      description: normalization uncertainty for ttW production.
+  - from: DYJetsNorm_
+    to: CMS_TOP26001_cross_section_DYJets
+    check_names:
+      description: normalization uncertainty for DY+jets production.
+  - from: WJetsNorm_
+    to: CMS_TOP26001_cross_section_WJets
+    check_names:
+      description: normalization uncertainty for W+jets production.
+  - from: QCD_Data_Driven_Norm_{CHANNEL}_{ERA}_
+    to: CMS_TOP26001_QCD_Data_Driven_Norm_{CHANNEL}_{ERA}_
+    check_names:
+      description: normalization uncertainty for the data-driven QCD estimate in the
+        {CHANNEL} channel for {ERA}.
+  - from: ttbbXsec
+    to: CMS_TOP26001_ttbbXsec
+    check_names:
+      description: rate parameter controlling the tt+bb normalization.
+  - from: ttccXsec
+    to: CMS_TOP26001_ttccXsec
+    check_names:
+      description: rate parameter controlling the tt+cc normalization.
+  - from: ttjjXsec
+    to: CMS_TOP26001_ttjjXsec
+    check_names:
+      description: rate parameter constraining the residual tt+jj normalization as
+        a function of ttbbXsec and ttccXsec.
+  - from: QCD_TF_Eta_Bin{eta}_Pt_Bin{pt}_{ERA}_{CHANNEL}_
+    to: CMS_TOP26001_QCDTF_EtaBin{eta}_PtBin{pt}_{CHANNEL}_{ERA}
+    check_names:
+      description: QCD transfer-factor uncertainty for eta bin {eta}, pT bin {pt},
+        channel {CHANNEL}, era {ERA}.

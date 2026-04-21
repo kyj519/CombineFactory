@@ -101,6 +101,98 @@ def _is_roorealvar(v) -> bool:
     except Exception:
         return False
 
+def _is_rooabspdf(v) -> bool:
+    try:
+        return hasattr(ROOT, "RooAbsPdf") and isinstance(v, ROOT.RooAbsPdf)
+    except Exception:
+        return False
+
+def _is_rooabsreal(v) -> bool:
+    try:
+        return hasattr(ROOT, "RooAbsReal") and isinstance(v, ROOT.RooAbsReal)
+    except Exception:
+        return False
+
+def _collect_named_terms_from_additive(obj, pre):
+    out = []
+
+    if hasattr(obj, "pdfList") and hasattr(obj, "coefList"):
+        try:
+            pdfs = obj.pdfList()
+            coefs = obj.coefList()
+            n = min(pdfs.getSize(), coefs.getSize())
+            for i in range(n):
+                p = pdfs.at(i)
+                c = coefs.at(i)
+                pname = p.GetName() if p else ""
+                cname = c.GetName() if c else ""
+                if pre.search(pname) or pre.search(cname):
+                    out.append(("pdf_coef", p, c))
+        except Exception:
+            pass
+
+    if hasattr(obj, "funcList") and hasattr(obj, "coefList"):
+        try:
+            funcs = obj.funcList()
+            coefs = obj.coefList()
+            n = min(funcs.getSize(), coefs.getSize())
+            for i in range(n):
+                f = funcs.at(i)
+                c = coefs.at(i)
+                fname = f.GetName() if f else ""
+                cname = c.GetName() if c else ""
+                if pre.search(fname) or pre.search(cname):
+                    out.append(("func_coef", f, c))
+        except Exception:
+            pass
+
+    return out
+
+def _resolve_process_components(ch_pdf, process_filter: Optional[str]):
+    if not process_filter:
+        return None
+
+    pre = re.compile(process_filter)
+    comps = ch_pdf.getComponents()
+    it = comps.createIterator()
+    selected_by_name = {}
+    available_names = []
+
+    additive_terms = []
+    while True:
+        obj = it.Next()
+        if not obj:
+            break
+        name = obj.GetName()
+        available_names.append(name)
+        if _is_rooabspdf(obj) and name != ch_pdf.GetName() and pre.search(name):
+            selected_by_name[name] = obj
+
+        additive_terms.extend(_collect_named_terms_from_additive(obj, pre))
+
+    if additive_terms:
+        seen = set()
+        out = []
+        for kind, shape_obj, coef_obj in additive_terms:
+            if shape_obj is None or coef_obj is None:
+                continue
+            key = (kind, shape_obj.GetName(), coef_obj.GetName())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((kind, shape_obj, coef_obj))
+        if out:
+            return out
+
+    selected = [("pdf_only", selected_by_name[k], None) for k in sorted(selected_by_name.keys())]
+    if not selected:
+        available = ", ".join(sorted(set(available_names)))
+        raise RuntimeError(
+            f"No process components matched '{process_filter}' in '{ch_pdf.GetName()}'. "
+            f"Available pdf components: {available}"
+        )
+    return selected
+
 def _snapshot_params(pdf, data):
     return ROOT.RooArgSet(pdf.getParameters(data))
 
@@ -123,7 +215,7 @@ def _freeze_all_realvars(pars, freeze=True):
         if _is_roorealvar(v):
             v.setConstant(freeze)
 
-def _evaluate_hist(pdf, data, cat, state_label, obs, nbins: Optional[int] = None):
+def _evaluate_hist(pdf, data, cat, state_label, obs, nbins: Optional[int] = None, process_filter: Optional[str] = None):
     _set_category_state(cat, state_label)
 
     if hasattr(ROOT, "RooSimultaneous") and isinstance(pdf, ROOT.RooSimultaneous):
@@ -136,6 +228,53 @@ def _evaluate_hist(pdf, data, cat, state_label, obs, nbins: Optional[int] = None
     if nbins is None:
         nbins = obs.getBins()
     binning = ROOT.RooBinning(nbins, obs.getMin(), obs.getMax())
+
+    selected_components = _resolve_process_components(ch_pdf, process_filter)
+    if selected_components is not None:
+        obs_set = ROOT.RooArgSet(obs)
+        edges = None
+        y_sum = np.zeros(nbins, dtype=float)
+
+        for kind, shape_obj, coef_obj in selected_components:
+            if not (_is_rooabspdf(shape_obj) or _is_rooabsreal(shape_obj)):
+                continue
+
+            h_comp = shape_obj.createHistogram(
+                f"h_{obs.GetName()}_{state_label}_{shape_obj.GetName()}",
+                obs,
+                ROOT.RooFit.Binning(binning),
+            )
+
+            integral = h_comp.Integral()
+            nexp = 0.0
+
+            if kind in ("pdf_coef", "func_coef") and _is_rooabsreal(coef_obj):
+                nexp = coef_obj.getVal()
+                if integral > 0 and nexp > 0:
+                    h_comp.Scale(nexp / integral)
+            else:
+                try:
+                    nexp = shape_obj.expectedEvents(obs_set)
+                except Exception:
+                    try:
+                        nexp = shape_obj.expectedEvents()
+                    except Exception:
+                        nexp = 0.0
+                if integral > 0 and nexp > 0:
+                    h_comp.Scale(nexp / integral)
+
+            if edges is None:
+                edges = np.array(
+                    [h_comp.GetXaxis().GetBinLowEdge(i) for i in range(1, nbins + 2)],
+                    dtype=float,
+                )
+            y_sum += np.array(
+                [h_comp.GetBinContent(i) for i in range(1, nbins + 1)],
+                dtype=float,
+            )
+
+        x = 0.5 * (edges[:-1] + edges[1:])
+        return x, y_sum, edges
 
     h = ch_pdf.createHistogram(
         f"h_{obs.GetName()}_{state_label}",
@@ -164,13 +303,13 @@ def _evaluate_hist(pdf, data, cat, state_label, obs, nbins: Optional[int] = None
     )
     return x, y, edges
 
-def _evaluate_hist_with_nuis(pdf, data, cat, state_label, obs, nuis, shift, nbins: Optional[int] = None):
+def _evaluate_hist_with_nuis(pdf, data, cat, state_label, obs, nuis, shift, nbins: Optional[int] = None, process_filter: Optional[str] = None):
     if not _is_roorealvar(nuis) or not hasattr(nuis, "setVal"):
-        return _evaluate_hist(pdf, data, cat, state_label, obs, nbins)
+        return _evaluate_hist(pdf, data, cat, state_label, obs, nbins, process_filter)
     orig = nuis.getVal()
     nuis.setVal(orig + shift)
     try:
-        x, y, edges = _evaluate_hist(pdf, data, cat, state_label, obs, nbins)
+        x, y, edges = _evaluate_hist(pdf, data, cat, state_label, obs, nbins, process_filter)
     finally:
         nuis.setVal(orig)
     return x, y, edges
@@ -238,13 +377,37 @@ def _trim_trailing_zeros(x, edges, *ys):
             
     return (x[:last_idx], new_edges, *trimmed_ys)
 
+def _build_scale_outdir(outdir: str, logy: bool) -> str:
+    scale_tag = "logy" if logy else "liny"
+    norm_outdir = os.path.normpath(outdir)
+    leaf = os.path.basename(norm_outdir)
+    if leaf == scale_tag or leaf.endswith(f"_{scale_tag}"):
+        return outdir
+    return os.path.join(outdir, scale_tag)
+
+def _find_positive_minimum(*ys) -> Optional[float]:
+    positive_mins = []
+    for y in ys:
+        if y is None:
+            continue
+        arr = np.asarray(y, dtype=float)
+        if arr.size == 0:
+            continue
+        arr = arr[arr > 0]
+        if arr.size:
+            positive_mins.append(float(np.min(arr)))
+    if not positive_mins:
+        return None
+    return min(positive_mins)
+
 
 # ------------------------------
 # Plotting: Optimized & Beautified
 # ------------------------------
 
 def _draw_one_nuis_one_channel(
-    pdf, data, cat, obs, nv, st, step, outdir, lumi, x_nom, y_nom, nbins: Optional[int], edges
+    pdf, data, cat, obs, nv, st, step, outdir, lumi, x_nom, y_nom, nbins: Optional[int], edges,
+    process_filter: Optional[str] = None, logy: bool = False,
 ):
     # ---------------------------------------------------------
     # Aesthetic Setup
@@ -259,20 +422,29 @@ def _draw_one_nuis_one_channel(
     # ---------------------------------------------------------
     # Calculate Variations
     # ---------------------------------------------------------
-    x_up, y_up, _ = _evaluate_hist_with_nuis(pdf, data, cat, st, obs, nv, +step, nbins)
-    x_dn, y_dn, _ = _evaluate_hist_with_nuis(pdf, data, cat, st, obs, nv, -step, nbins)
+    x_up, y_up, _ = _evaluate_hist_with_nuis(pdf, data, cat, st, obs, nv, +step, nbins, process_filter)
+    x_dn, y_dn, _ = _evaluate_hist_with_nuis(pdf, data, cat, st, obs, nv, -step, nbins, process_filter)
 
     # Data
     x_data = y_data = None
-    try:
-        x_data, y_data, _ = _evaluate_data_hist(data, cat, st, obs, nbins=nbins, edges=edges)
-    except Exception:
-        x_data = y_data = None
+    if process_filter is None:
+        try:
+            x_data, y_data, _ = _evaluate_data_hist(data, cat, st, obs, nbins=nbins, edges=edges)
+        except Exception:
+            x_data = y_data = None
 
     # Trim Zeros (Make plot tighter)
     x_plot, edges_plot, y_nom_p, y_up_p, y_dn_p, y_data_p = _trim_trailing_zeros(
         x_nom, edges, y_nom, y_up, y_dn, y_data
     )
+    positive_floor = None
+    y_nom_draw, y_up_draw, y_dn_draw = y_nom_p, y_up_p, y_dn_p
+    if logy:
+        min_positive = _find_positive_minimum(y_nom_p, y_up_p, y_dn_p, y_data_p)
+        positive_floor = max((min_positive / 5.0) if min_positive is not None else 0.0, 1e-6)
+        y_nom_draw = np.clip(y_nom_p, positive_floor, None)
+        y_up_draw = np.clip(y_up_p, positive_floor, None)
+        y_dn_draw = np.clip(y_dn_p, positive_floor, None)
 
     # ---------------------------------------------------------
     # Main Pad Plotting (The "Cosmetic" Upgrade)
@@ -280,45 +452,62 @@ def _draw_one_nuis_one_channel(
     
     # 1. Fill deviations (Shading) - 이것이 "밤티나는" 포인트
     # Nominal과 Up/Down 사이를 칠해서 차이를 시각적으로 강조
-    hep.histplot(y_nom_p, bins=edges_plot, ax=ax, color="black", label="Nominal", histtype="step", linewidth=2)
+    hep.histplot(y_nom_draw, bins=edges_plot, ax=ax, color="black", label="Nominal", histtype="step", linewidth=2)
     
     # Up (+1sigma)
-    hep.histplot(y_up_p, bins=edges_plot, ax=ax, color="#E41A1C", label=f"{nv.GetName()} $+1\sigma$", histtype="step", linestyle="--")
+    hep.histplot(y_up_draw, bins=edges_plot, ax=ax, color="#E41A1C", label=f"{nv.GetName()} $+1\sigma$", histtype="step", linestyle="--")
     # Down (-1sigma)
-    hep.histplot(y_dn_p, bins=edges_plot, ax=ax, color="#377EB8", label=f"{nv.GetName()} $-1\sigma$", histtype="step", linestyle="--")
+    hep.histplot(y_dn_draw, bins=edges_plot, ax=ax, color="#377EB8", label=f"{nv.GetName()} $-1\sigma$", histtype="step", linestyle="--")
 
     # Fill areas for emphasis
     # step='mid' to match histogram style logic
-    ax.fill_between(x_plot, y_nom_p, y_up_p, color="#E41A1C", alpha=0.1, step='mid', label=None)
-    ax.fill_between(x_plot, y_nom_p, y_dn_p, color="#377EB8", alpha=0.1, step='mid', label=None)
+    ax.fill_between(x_plot, y_nom_draw, y_up_draw, color="#E41A1C", alpha=0.1, step='mid', label=None)
+    ax.fill_between(x_plot, y_nom_draw, y_dn_draw, color="#377EB8", alpha=0.1, step='mid', label=None)
 
     # 2. Data Points
     if y_data_p is not None:
-        yerr = np.sqrt(y_data_p)
-        # Use simple errorbar for clean look
-        ax.errorbar(
-            x_plot, y_data_p, yerr=yerr, 
-            fmt="ko",        # Black circles
-            capsize=0,       # No caps looks cleaner
-            markersize=6, 
-            label="Data", 
-            elinewidth=1.5
-        )
+        data_mask = np.ones_like(y_data_p, dtype=bool)
+        if logy:
+            data_mask = y_data_p > 0
+        if np.any(data_mask):
+            yerr = np.sqrt(y_data_p[data_mask])
+            # Use simple errorbar for clean look
+            ax.errorbar(
+                x_plot[data_mask], y_data_p[data_mask], yerr=yerr,
+                fmt="ko",        # Black circles
+                capsize=0,       # No caps looks cleaner
+                markersize=6,
+                label="Data",
+                elinewidth=1.5
+            )
 
     # 3. Styling
     ax.set_ylabel("Events / Bin", fontsize=24)
-    # y축 로그 스케일 여부는 데이터에 따라 결정 (여기서는 선형 유지)
-    max_y = max(np.max(y_nom_p), np.max(y_up_p) if len(y_up_p) else 0)
-    if y_data_p is not None:
+    max_y = max(
+        np.max(y_nom_p) if len(y_nom_p) else 0,
+        np.max(y_up_p) if len(y_up_p) else 0,
+        np.max(y_dn_p) if len(y_dn_p) else 0,
+    )
+    if y_data_p is not None and len(y_data_p):
         max_y = max(max_y, np.max(y_data_p))
-    ax.set_ylim(0, max_y * 1.35) # Legend space 확보
+    if logy:
+        ax.set_yscale("log")
+        ymin = positive_floor if positive_floor is not None else 1e-6
+        ymax = max(max_y * 20.0, ymin * 10.0)
+        ax.set_ylim(ymin, ymax)
+    else:
+        ax.set_ylim(0, max_y * 1.35 if max_y > 0 else 1.0) # Legend space 확보
     
+    legend_title = f"Channel: {st}"
+    if process_filter:
+        legend_title = f"Channel: {st} | Proc: {process_filter}"
+
     ax.legend(
         loc="upper right", 
         ncol=2, 
         fontsize=18, 
         frameon=False,
-        title=f"Channel: {st}"
+        title=legend_title
     )
     
     # CMS Label
@@ -359,7 +548,10 @@ def _draw_one_nuis_one_channel(
     rax.grid(True, axis='y', linestyle=':', alpha=0.5)
 
     # Save
-    base = os.path.join(outdir, f"prefit_pernuis_{nv.GetName()}_{st}")
+    proc_tag = ""
+    if process_filter:
+        proc_tag = "_proc_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", process_filter).strip("_")
+    base = os.path.join(outdir, f"prefit_pernuis_{nv.GetName()}_{st}{proc_tag}")
     fig.savefig(base + ".png", dpi=200, bbox_inches='tight')
     fig.savefig(base + ".pdf", bbox_inches='tight')
     plt.close(fig)
@@ -370,7 +562,8 @@ def _draw_one_nuis_one_channel(
 
 def plot_per_nuis_prefit(
     mc, pdf, data, cat, obs, outdir, nuis_filter=None, per_channel=True, lumi="138",
-    channel_filter: Optional[str] = None, nbins: Optional[int] = None
+    channel_filter: Optional[str] = None, nbins: Optional[int] = None,
+    process_filter: Optional[str] = None, logy: bool = False,
 ):
     # (이 부분은 원본과 거의 동일하지만 Lumi 포맷만 string으로 받도록 처리)
     pars = pdf.getParameters(data)
@@ -402,10 +595,15 @@ def plot_per_nuis_prefit(
     if channel_filter:
         cre = re.compile(channel_filter)
         states = [s for s in states if cre.search(s)]
+    outdir = _build_scale_outdir(outdir, logy)
     _ensure_dir(outdir)
 
     print(f"[INFO] Selected nuisances: {len(nuis_list)}")
     print(f"[INFO] Selected channels: {len(states)}")
+    print(f"[INFO] Y-axis scale: {'log' if logy else 'linear'}")
+    print(f"[INFO] Output directory: {outdir}")
+    if process_filter:
+        print(f"[INFO] Process filter: {process_filter}")
 
     if not nuis_list:
         print("[WARN] No nuisances matched. Nothing to plot.")
@@ -413,7 +611,7 @@ def plot_per_nuis_prefit(
 
     if per_channel:
         for st in states:
-            x_nom, y_nom, edges = _evaluate_hist(pdf, data, cat, st, obs, nbins)
+            x_nom, y_nom, edges = _evaluate_hist(pdf, data, cat, st, obs, nbins, process_filter)
             for nv in nuis_list:
                 nv.setConstant(False)
                 step = nv.getError() if hasattr(nv, "getError") else 1.0
@@ -421,7 +619,7 @@ def plot_per_nuis_prefit(
                 try:
                     _draw_one_nuis_one_channel(
                         pdf, data, cat, obs, nv, st, step, outdir, lumi,
-                        x_nom, y_nom, nbins, edges
+                        x_nom, y_nom, nbins, edges, process_filter, logy
                     )
                 finally:
                     nv.setConstant(True)
@@ -450,7 +648,11 @@ def main():
     ap.add_argument("--out", dest="outdir", default="pernuis_prefit_pretty")
     ap.add_argument("--lumi", default="138") # Just number
     ap.add_argument("--channel-filter", default=None)
+    ap.add_argument("--process-filter", default=None,
+                    help="Regex for pdf component names to select process(es), e.g. 'ttbb|TTBar'")
     ap.add_argument("--nbins", type=int, default=None)
+    ap.add_argument("--logy", action="store_true",
+                    help="Use log scale on the main y-axis. Outputs are saved under <out>/logy (default: <out>/liny).")
     args = ap.parse_args()
 
     tf = ROOT.TFile.Open(args.ws_file, "READ")
@@ -468,6 +670,7 @@ def main():
         outdir=args.outdir, nuis_filter=args.nuis_filter,
         per_channel=args.per_channel, lumi=args.lumi,
         channel_filter=args.channel_filter, nbins=args.nbins,
+        process_filter=args.process_filter, logy=args.logy,
     )
 
 if __name__ == "__main__":

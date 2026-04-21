@@ -146,7 +146,6 @@ class Config:
     special_case_map: Dict[str, str] = field(default_factory=dict)  # special cases for renaming
     norm_dict: Dict[str, float] = field(default_factory=dict)  # e.g. {'ttV': 20}
     regions: Optional[List[str]] = None  # if None, auto-discover
-    rebin: int = 1  # rebin factor for histograms
 
     @classmethod
     def from_args(cls, args) -> "Config":
@@ -188,7 +187,6 @@ class Config:
             special_case_map=special_case_map,
             norm_dict=norm_dict,
             regions=regs,
-            rebin=args.rebin
         )
     
     @classmethod
@@ -555,78 +553,18 @@ def _get_io_folder(fin: ROOT.TFile, fout: ROOT.TFile, cfg: Config, region: str, 
     
     return in_region, out_region, in_syst, out_syst, renamed_syst
 
-import ROOT, math
-from array import array
-
-def _rebin_histogram(h: ROOT.TH1, rebin_factor: int, *, name_suffix: str | None = None,
-                     include_original_underflow: bool = True) -> ROOT.TH1:
+def _apply_floor(h: ROOT.TH1, floor_val: float = 1e-5) -> None:
     """
-    Rebin histogram while KEEPING the original name.
-    Overwrites by returning a new TH1 that has the same name as `h`.
+    Combine Toy Fit에서 발생하는 0 경계값(Zero-Boundary) 바이어스를 방지하기 위해,
+    빈 값이 지정된 바닥값(floor_val)보다 작으면 강제로 끌어올립니다.
     """
-    if not isinstance(h, ROOT.TH1):
-        raise TypeError(f"Expected ROOT.TH1, got {type(h)}")
-
-    # No change
-    if rebin_factor <= 1 or rebin_factor >= h.GetXaxis().GetNbins():
-        h.SetDirectory(0)
-        return h
-
-    ax = h.GetXaxis()
-    nb = ax.GetNbins()
-    if rebin_factor > nb:
-        raise ValueError(f"rebin_factor={rebin_factor} > nbins={nb}")
-
-    old_name = h.GetName()
-    old_title = h.GetTitle()
-
-    # Case 1: divisible -> standard Rebin
-    if nb % rebin_factor == 0:
-        out = h.Rebin(rebin_factor, "__tmp_rebin__")
-        out.SetDirectory(0)
-        out.SetName(old_name)
-        out.SetTitle(old_title)
-        return out
-
-    # Case 2: right-aligned variable-bin rebin
-    leftover = nb % rebin_factor           # bins to move into underflow (left side)
-    start_bin = leftover + 1
-    n_groups = nb // rebin_factor
-
-    # Build edges: [x(start), x(start+rf), ..., x(upper of nb)]
-    edges = [ax.GetBinLowEdge(start_bin + m * rebin_factor) for m in range(n_groups)]
-    edges.append(ax.GetBinUpEdge(nb))
-    arr = array('d', edges)
-
-    # Collect left leftovers -> to underflow
-    sum_left_c = 0.0
-    sum_left_e2 = 0.0
-    if leftover > 0:
-        for i in range(1, leftover + 1):
-            sum_left_c += h.GetBinContent(i)
-            e = h.GetBinError(i)
-            sum_left_e2 += e * e
-
-    if include_original_underflow:
-        sum_left_c += h.GetBinContent(0)
-        e0 = h.GetBinError(0)
-        sum_left_e2 += e0 * e0
-
-    # Perform variable rebin with a temporary name, then restore original name
-    out = h.Rebin(len(arr) - 1, "__tmp_rebin__", arr)
-    out.SetDirectory(0)
-
-    # Add our computed leftover to underflow explicitly
-    uf_c = out.GetBinContent(0) + sum_left_c
-    uf_e = math.sqrt(out.GetBinError(0) ** 2 + sum_left_e2)
-    out.SetBinContent(0, uf_c)
-    out.SetBinError(0, uf_e)
-
-    # Restore original identity
-    out.SetName(old_name)
-    out.SetTitle(old_title)
-
-    return out
+    nb = h.GetNbinsX()
+    for i in range(1, nb + 1):
+        if h.GetBinContent(i) < floor_val:
+            h.SetBinContent(i, floor_val)
+            # 빈 에러가 0인 경우 MINUIT 계산 에러를 막기 위해 에러도 미세하게 채워줍니다.
+            if h.GetBinError(i) < floor_val:
+                h.SetBinError(i, floor_val)
 # --------------------------
 # Merge logic
 # --------------------------
@@ -659,7 +597,6 @@ def _merge_procs_in_syst(
         if h:
             h = _clone(h, var or h.GetName())
             h.SetDirectory(0)  # Detach from in_syst
-            h = _rebin_histogram(h, cfg.rebin) if region != "Signal_dfd" else h
             out_data.WriteTObject(h, var or h.GetName(), "Overwrite")
             return
         else:
@@ -764,8 +701,11 @@ def _merge_procs_in_syst(
                 alpha=(cfg.alpha if cfg.alpha >= 0 else 0.5),
                 max_radius=3,
             )
-            if region != "Signal_dfd":
-                merged_hist = _rebin_histogram(merged_hist, cfg.rebin)
+                
+            # [NEW] 데이터가 아닌 MC 템플릿에만 Floor를 적용합니다.
+            if not _is_data_proc(out_name):
+                _apply_floor(merged_hist, floor_val=1e-5)
+                
             out_proc.WriteTObject(merged_hist, var or merged_hist.GetName(),"Overwrite")
             
     if renamed_syst == "Nominal" and cfg.norm_dict:
@@ -1021,8 +961,10 @@ def _write_others_norm_systs(*, in_syst: ROOT.TDirectoryFile, out_region: ROOT.T
                 alpha=(cfg.alpha if cfg.alpha >= 0 else 0.5),
                 max_radius=3,
             )
-            if region != "Signal_dfd":
-                up_hist = _rebin_histogram(up_hist, cfg.rebin)
+            
+            # [NEW] Floor 적용
+            _apply_floor(up_hist, floor_val=1e-5)
+            
             out_syst_up = _safe_mkdir(out_region, f"{cat}Norm_Up")
             out_proc_up = _safe_mkdir(out_syst_up, "Others")
             out_proc_up.WriteTObject(up_hist, var or up_hist.GetName(), "Overwrite")
@@ -1042,8 +984,10 @@ def _write_others_norm_systs(*, in_syst: ROOT.TDirectoryFile, out_region: ROOT.T
                 alpha=(cfg.alpha if cfg.alpha >= 0 else 0.5),
                 max_radius=3,
             )
-            if region != "Signal_dfd":
-                dn_hist = _rebin_histogram(dn_hist, cfg.rebin)
+                
+            # [NEW] Floor 적용
+            _apply_floor(dn_hist, floor_val=1e-5)
+            
             out_syst_dn = _safe_mkdir(out_region, f"{cat}Norm_Down")
             out_proc_dn = _safe_mkdir(out_syst_dn, "Others")
             out_proc_dn.WriteTObject(dn_hist, var or dn_hist.GetName(), "Overwrite")
@@ -1118,7 +1062,6 @@ def main():
     p.add_argument("--alpha", type=float, default=0, help="Jeffreys pseudo-count alpha. if set to negative, alpha is determined dynmically. (default: 0)")
     p.add_argument("--carry-unmapped", action="store_true", help="Copy procs not in merge map as-is")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    p.add_argument("--rebin", default=1, type=int, help="Rebin factor for histograms")
     args = p.parse_args()
 
     if args.verbose:

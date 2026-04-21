@@ -1,0 +1,99 @@
+vars:
+  stage_gof_enabled: "true"
+  gof_batch_name: "gof_toys"
+  gof_njobs: "1000"
+  gof_toys_per_job: "5"
+  gof_wait_seen_interval: "3"
+  gof_require_complete_toys: "true"
+  gof_hadd_jobs: "8"
+  gof_plot_mass: "120.0"
+
+steps:
+  - name: s60_01_gof_prepare_dir
+    enabled: "${stage_gof_enabled}"
+    needs: ["s20_06_workspace_quadratic"]
+    cmd: "mkdir -p GOF/roots GOF/log"
+
+  - name: s60_02_gof_submit_toys
+    enabled: "${stage_gof_enabled}"
+    needs: ["s60_01_gof_prepare_dir"]
+    workdir: "GOF"
+    cmd: "python3 ${cf_python}/submitGof.py --dir . --datacard ../${workspace_quadratic} --toys ${gof_toys_per_job} --tag ${gof_toy_tag} --njobs ${gof_njobs} --batch-name ${gof_batch_name}"
+
+  - name: s60_03_gof_wait_toys
+    enabled: "${stage_gof_enabled}"
+    needs: ["s60_02_gof_submit_toys"]
+    workdir: "GOF"
+    cmd: |
+      if ! command -v condor_q >/dev/null 2>&1; then
+        echo "condor_q not found; skip waiting for ${gof_batch_name}"
+        exit 0
+      fi
+      batch_active() {
+        local batch="$1"
+        condor_q "$USER" -af JobBatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        condor_q "$USER" -af BatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        return 1
+      }
+
+      while true; do
+        if batch_active "${gof_batch_name}"; then
+          break
+        fi
+        shopt -s nullglob
+        local_files=(higgsCombine${gof_toy_tag}.GoodnessOfFit.mH120.*.root)
+        moved_files=(roots/higgsCombine${gof_toy_tag}.GoodnessOfFit.mH120.*.root)
+        n_total=$((${#local_files[@]} + ${#moved_files[@]}))
+        if [ "$n_total" -ge "${gof_njobs}" ]; then
+          echo "[wait] batch not visible but found ${n_total}/${gof_njobs} toy files; continue"
+          exit 0
+        fi
+        echo "[wait-init] ${gof_batch_name} not visible yet (${n_total}/${gof_njobs} toy files)"
+        sleep ${gof_wait_seen_interval}
+      done
+
+      while batch_active "${gof_batch_name}"; do
+        echo "[wait] ${gof_batch_name}"
+        sleep ${wait_poll_seconds}
+      done
+      echo "[done] ${gof_batch_name} no longer in condor_q"
+
+  - name: s60_04_gof_observed
+    enabled: "${stage_gof_enabled}"
+    needs: ["s60_01_gof_prepare_dir"]
+    workdir: "GOF"
+    cmd: "combineTool.py -M GoodnessOfFit ../${workspace_quadratic} --algo=saturated -n ${gof_obs_tag} --setParametersForFit '${mask_signals_expr}' --setParametersForEval '${mask_signals_expr}' --freezeParameters r --setParameters r=0"
+
+  - name: s60_05_gof_collect
+    enabled: "${stage_gof_enabled}"
+    needs: ["s60_03_gof_wait_toys", "s60_04_gof_observed"]
+    workdir: "GOF"
+    cmd: |
+      shopt -s nullglob
+      for f in higgsCombine${gof_toy_tag}.GoodnessOfFit.mH120.*.root; do
+        mv -f "$f" roots/
+      done
+      toy_files=(roots/higgsCombine${gof_toy_tag}.GoodnessOfFit.mH120.*.root)
+      n_toys=${#toy_files[@]}
+      echo "[collect] toy files found: ${n_toys}"
+      if [ "$n_toys" -eq 0 ]; then
+        echo "No toy ROOT files in GOF/roots" >&2
+        exit 1
+      fi
+
+      require_complete="$(echo "${gof_require_complete_toys}" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$require_complete" == "1" || "$require_complete" == "true" || "$require_complete" == "yes" ]]; then
+        if [ "$n_toys" -lt "${gof_njobs}" ]; then
+          echo "[ERR] Expected ${gof_njobs} toy files, found ${n_toys}. GOF toys are incomplete." >&2
+          exit 1
+        fi
+      fi
+
+      hadd -j ${gof_hadd_jobs} toys.root "${toy_files[@]}"
+      combineTool.py -M CollectGoodnessOfFit --input higgsCombine${gof_obs_tag}.GoodnessOfFit.mH120.root toys.root -m 125.0 -o gof.json
+
+  - name: s60_06_gof_plot
+    enabled: "${stage_gof_enabled}"
+    needs: ["s60_05_gof_collect"]
+    workdir: "GOF"
+    cmd: "python3 ${cf_python}/plotGof.py gof.json --statistic saturated --mass ${gof_plot_mass} -o gof_plot"

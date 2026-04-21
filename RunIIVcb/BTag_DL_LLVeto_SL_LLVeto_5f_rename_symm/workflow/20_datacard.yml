@@ -1,0 +1,57 @@
+vars:
+  stage_datacard_enabled: "true"
+  shape_to_lnn_systematics: "CMS_TOP26001_topmass ps_hdamp CMS_TOP26001_mc_tune_CP5 ps_CR1_ttbar ps_CR2_ttbar CMS_TOP26001_erdOn"
+
+steps:
+  - name: s20_01_build_datacards
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s10_10_prepare_fix_qcd_tf_names"]
+    cmd: "python3 ${cf_python}/build_datacards.py -c config.yml"
+
+  - name: s20_02_combine_cards
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_01_build_datacards"]
+    cmd: |
+      combineCards.py $(for f in *.txt; do
+        case "$f" in
+          ${datacard_txt}|${datacard_txt_quad}) continue ;;
+        esac
+        b=${f%.txt}
+        echo ${b}=$f
+      done) > ${datacard_txt}
+
+  - name: s20_02a_rename_systematics
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_02_combine_cards"]
+    cmd: "python3 ${cf_python}/rename_systematics.py --config config.yml --datacard ${datacard_txt}"
+
+  - name: s20_02b_symmetrize_shapes
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_02a_rename_systematics"]
+    cmd: "python3 ${cf_python}/symmetrize_shapes.py --config config.yml"
+
+
+  - name: s20_03_shape_to_lnn
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_02b_symmetrize_shapes"]
+    cmd: |
+      script="${cf_python}/shape_to_lnN.py"
+      for syst in ${shape_to_lnn_systematics}; do
+        echo "=== ${syst} ==="
+        python3 "$script" ${datacard_txt} "${syst}"
+      done
+
+  - name: s20_04_workspace_linear
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_03_shape_to_lnn"]
+    cmd: "text2workspace.py ./${datacard_txt} -P HiggsAnalysis.CombinedLimit.VcbModel:brVcbModel --channel-masks --for-fits --no-wrappers --optimize-simpdf-constraints=cms --X-pack-asympows --use-histsum"
+
+  - name: s20_05_copy_quad_datacard
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_04_workspace_linear"]
+    cmd: "cp ${datacard_txt} ${datacard_txt_quad}"
+
+  - name: s20_06_workspace_quadratic
+    enabled: "${stage_datacard_enabled}"
+    needs: ["s20_05_copy_quad_datacard"]
+    cmd: "text2workspace.py ./${datacard_txt_quad} -P HiggsAnalysis.CombinedLimit.VcbModel:brVcbModel2 --channel-masks --for-fits --no-wrappers --optimize-simpdf-constraints=cms --X-pack-asympows --use-histsum"

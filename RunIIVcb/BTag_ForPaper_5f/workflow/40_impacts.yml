@@ -1,0 +1,215 @@
+vars:
+  stage_impacts_enabled: "true"
+  impact_asimov_initial_setpars: "r=1,CMS_TOP26001_ttbbXsec=1.36,CMS_TOP26001_ttccXsec=1.11"
+  impact_asimov_fit_opts: "--robustFit 1 --rMin -1 --rMax 5"
+  impact_asimov_job_opts: "--job-mode condor"
+  impact_asimov_task_name: "impact_asimov_fits"
+  impact_morphed_setpars: "r=1"
+  impact_morphed_fit_opts: "--robustFit 1 --rMin -1 --rMax 3"
+  impact_morphed_job_opts: "--job-mode condor"
+  impact_morphed_task_name: "impact_morphed_fits"
+  impact_wait_seen_interval: "3"
+  impact_validate_interval: "5"
+  impact_require_complete_fits: "true"
+
+steps:
+  - name: s40_01_impact_prepare_dirs
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s30_01_pull_fit_fast"]
+    cmd: "mkdir -p Impact/asimov Impact/morphed"
+
+  - name: s40_02_impact_asimov_initial
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_01_impact_prepare_dirs"]
+    workdir: "Impact/asimov"
+    cmd: "combineTool.py -M Impacts -d ../../${workspace_linear} -m 125 --doInitialFit ${impact_asimov_fit_opts} -t -1 --setParameters \"${impact_asimov_initial_setpars}\""
+
+  - name: s40_03_impact_asimov_fits
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_02_impact_asimov_initial"]
+    workdir: "Impact/asimov"
+    cmd: "combineTool.py -M Impacts -d ../../${workspace_linear} -m 125 -t -1 --doFits ${impact_asimov_fit_opts} --setParameters \"${impact_asimov_initial_setpars}\" ${impact_asimov_job_opts} --task-name ${impact_asimov_task_name}"
+
+  - name: s40_04_impact_asimov_wait
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_03_impact_asimov_fits"]
+    workdir: "Impact/asimov"
+    cmd: |
+      if ! command -v condor_q >/dev/null 2>&1; then
+        echo "condor_q not found; skip waiting for ${impact_asimov_task_name}"
+        exit 0
+      fi
+      batch_active() {
+        local batch="$1"
+        condor_q "$USER" -af JobBatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        condor_q "$USER" -af BatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        return 1
+      }
+      count_fit_files() {
+        shopt -s nullglob
+        fit_files=(higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root)
+        echo "${#fit_files[@]}"
+      }
+      validate_fits_ready() {
+        python3 ${cf_python}/validate_impact_fits.py \
+          --glob "higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root" \
+          --expected "${expected}" \
+          --summary-only
+      }
+
+      expected="$(awk '/^[[:space:]]*queue[[:space:]]+[0-9]+/{print $2; exit}' "condor_${impact_asimov_task_name}.sub" 2>/dev/null || true)"
+      [ -n "$expected" ] || expected=0
+
+      while true; do
+        if batch_active "${impact_asimov_task_name}"; then
+          seen=1
+          break
+        fi
+        n_fits="$(count_fit_files)"
+        if [ "$expected" -gt 0 ] && [ "$n_fits" -ge "$expected" ]; then
+          echo "[wait] batch not visible but found ${n_fits}/${expected} fit files; continue to readability checks"
+          break
+        fi
+        echo "[wait-init] ${impact_asimov_task_name} not visible yet (${n_fits}/${expected} fit files)"
+        sleep ${impact_wait_seen_interval}
+      done
+
+      while batch_active "${impact_asimov_task_name}"; do
+        echo "[wait] ${impact_asimov_task_name}"
+        sleep ${wait_poll_seconds}
+      done
+      while true; do
+        if validate_fits_ready; then
+          break
+        fi
+        echo "[wait-validate] ${impact_asimov_task_name} fit files are not readable yet"
+        sleep ${impact_validate_interval}
+      done
+      echo "[done] ${impact_asimov_task_name} no longer in condor_q and fit files are readable"
+
+  - name: s40_05_impact_asimov_plot
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_04_impact_asimov_wait"]
+    workdir: "Impact/asimov"
+    cmd: |
+      shopt -s nullglob
+      fit_files=(higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root)
+      n_fits=${#fit_files[@]}
+      expected="$(awk '/^[[:space:]]*queue[[:space:]]+[0-9]+/{print $2; exit}' "condor_${impact_asimov_task_name}.sub" 2>/dev/null || true)"
+      [ -n "$expected" ] || expected=0
+      require_complete="$(echo "${impact_require_complete_fits}" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$require_complete" == "1" || "$require_complete" == "true" || "$require_complete" == "yes" ]]; then
+        if [ "$expected" -gt 0 ] && [ "$n_fits" -lt "$expected" ]; then
+          echo "[ERR] Asimov impacts incomplete: ${n_fits}/${expected} fit files" >&2
+          exit 1
+        fi
+      fi
+
+      if ! python3 ${cf_python}/validate_impact_fits.py --glob "higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root" --expected "${expected}" --summary-only; then
+        echo "[ERR] Asimov impact fit files are still not readable after wait step" >&2
+        exit 1
+      fi
+
+      combineTool.py -M Impacts -d ../../${workspace_linear} -m 125 -o impacts.json
+      plotImpacts.py -i impacts.json -o impacts
+
+  - name: s40_06_impact_morphed_import
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_01_impact_prepare_dirs"]
+    workdir: "Impact/morphed"
+    cmd: "python3 ${cf_python}/importPars.py ../../${workspace_linear} ../../fitDiagnostics${pull_tag_fast}.root"
+
+  - name: s40_07_impact_morphed_initial
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_06_impact_morphed_import"]
+    workdir: "Impact/morphed"
+    cmd: "combineTool.py -M Impacts -d morphedWorkspace_fitDiagnostics120.root -m 125 --doInitialFit ${impact_morphed_fit_opts} -t -1 --setParameters \"${impact_morphed_setpars}\""
+
+  - name: s40_08_impact_morphed_fits
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_07_impact_morphed_initial"]
+    workdir: "Impact/morphed"
+    cmd: "combineTool.py -M Impacts -d morphedWorkspace_fitDiagnostics120.root -m 125 -t -1 --doFits ${impact_morphed_fit_opts} --setParameters \"${impact_morphed_setpars}\" ${impact_morphed_job_opts} --task-name ${impact_morphed_task_name}"
+
+  - name: s40_09_impact_morphed_wait
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_08_impact_morphed_fits"]
+    workdir: "Impact/morphed"
+    cmd: |
+      if ! command -v condor_q >/dev/null 2>&1; then
+        echo "condor_q not found; skip waiting for ${impact_morphed_task_name}"
+        exit 0
+      fi
+      batch_active() {
+        local batch="$1"
+        condor_q "$USER" -af JobBatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        condor_q "$USER" -af BatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        return 1
+      }
+      count_fit_files() {
+        shopt -s nullglob
+        fit_files=(higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root)
+        echo "${#fit_files[@]}"
+      }
+      validate_fits_ready() {
+        python3 ${cf_python}/validate_impact_fits.py \
+          --glob "higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root" \
+          --expected "${expected}" \
+          --summary-only
+      }
+
+      expected="$(awk '/^[[:space:]]*queue[[:space:]]+[0-9]+/{print $2; exit}' "condor_${impact_morphed_task_name}.sub" 2>/dev/null || true)"
+      [ -n "$expected" ] || expected=0
+
+      while true; do
+        if batch_active "${impact_morphed_task_name}"; then
+          seen=1
+          break
+        fi
+        n_fits="$(count_fit_files)"
+        if [ "$expected" -gt 0 ] && [ "$n_fits" -ge "$expected" ]; then
+          echo "[wait] batch not visible but found ${n_fits}/${expected} fit files; continue to readability checks"
+          break
+        fi
+        echo "[wait-init] ${impact_morphed_task_name} not visible yet (${n_fits}/${expected} fit files)"
+        sleep ${impact_wait_seen_interval}
+      done
+
+      while batch_active "${impact_morphed_task_name}"; do
+        echo "[wait] ${impact_morphed_task_name}"
+        sleep ${wait_poll_seconds}
+      done
+      while true; do
+        if validate_fits_ready; then
+          break
+        fi
+        echo "[wait-validate] ${impact_morphed_task_name} fit files are not readable yet"
+        sleep ${impact_validate_interval}
+      done
+      echo "[done] ${impact_morphed_task_name} no longer in condor_q and fit files are readable"
+
+  - name: s40_10_impact_morphed_plot
+    enabled: "${stage_impacts_enabled}"
+    needs: ["s40_09_impact_morphed_wait"]
+    workdir: "Impact/morphed"
+    cmd: |
+      shopt -s nullglob
+      fit_files=(higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root)
+      n_fits=${#fit_files[@]}
+      expected="$(awk '/^[[:space:]]*queue[[:space:]]+[0-9]+/{print $2; exit}' "condor_${impact_morphed_task_name}.sub" 2>/dev/null || true)"
+      [ -n "$expected" ] || expected=0
+      require_complete="$(echo "${impact_require_complete_fits}" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$require_complete" == "1" || "$require_complete" == "true" || "$require_complete" == "yes" ]]; then
+        if [ "$expected" -gt 0 ] && [ "$n_fits" -lt "$expected" ]; then
+          echo "[ERR] Morphed impacts incomplete: ${n_fits}/${expected} fit files" >&2
+          exit 1
+        fi
+      fi
+
+      if ! python3 ${cf_python}/validate_impact_fits.py --glob "higgsCombine_paramFit_Test_*.MultiDimFit.mH125.root" --expected "${expected}" --summary-only; then
+        echo "[ERR] Morphed impact fit files are still not readable after wait step" >&2
+        exit 1
+      fi
+
+      combineTool.py -M Impacts -d morphedWorkspace_fitDiagnostics120.root -m 125 -o impacts.json
+      plotImpacts.py -i impacts.json -o impacts

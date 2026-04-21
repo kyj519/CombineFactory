@@ -38,17 +38,36 @@ def _short(s: str, n: int = 60) -> str:
     return s if len(s) <= n else (s[:n-3] + "...")
 
 
+def _use_s_fit(fit_mode: str) -> bool:
+    return fit_mode in ("both", "s")
+
+
+def _use_b_fit(fit_mode: str) -> bool:
+    return fit_mode in ("both", "b")
+
+
+def _is_robusthesse_dropped(var) -> bool:
+    if not var:
+        return False
+    try:
+        val = float(var.getVal())
+        err = float(var.getError())
+    except Exception:
+        return False
+    return math.isfinite(val) and math.isfinite(err) and err <= 0.0
+
+
 # ---------- IO ----------
-def read_fit(file_in: str):
+def read_fit(file_in: str, fit_mode: str = "both"):
     f = ROOT.TFile.Open(file_in)
     if not f or f.IsZombie():
         raise RuntimeError(f"Cannot open {file_in}")
-    fit_s = f.Get("fit_s")
-    fit_b = f.Get("fit_b")
+    fit_s = f.Get("fit_s") if _use_s_fit(fit_mode) else None
+    fit_b = f.Get("fit_b") if _use_b_fit(fit_mode) else None
     prefit = f.Get("nuisances_prefit")
-    if not fit_s or fit_s.ClassName() != "RooFitResult":
+    if _use_s_fit(fit_mode) and (not fit_s or fit_s.ClassName() != "RooFitResult"):
         raise RuntimeError(f"{file_in} missing 'fit_s' RooFitResult")
-    if not fit_b or fit_b.ClassName() != "RooFitResult":
+    if _use_b_fit(fit_mode) and (not fit_b or fit_b.ClassName() != "RooFitResult"):
         raise RuntimeError(f"{file_in} missing 'fit_b' RooFitResult")
     if not prefit or prefit.ClassName() != "RooArgSet":
         raise RuntimeError(f"{file_in} missing 'nuisances_prefit' RooArgSet")
@@ -123,15 +142,22 @@ def read_prefit_from_workspace(ws_file: str,
 # ---------- core ----------
 def build_rows(fit_s, fit_b, prefit,
                prefit_map: Dict[str, Tuple[float, float]] = None,
-               poi_set: set = None) -> List[Dict[str, Any]]:
+               poi_set: set = None,
+               fit_mode: str = "both") -> List[Dict[str, Any]]:
     poi_set = poi_set or set()
     rows = []
-    fpf_s = fit_s.floatParsFinal()
-    fpf_b = fit_b.floatParsFinal()
+    use_s = _use_s_fit(fit_mode) and fit_s is not None
+    use_b = _use_b_fit(fit_mode) and fit_b is not None
+    fpf_s = fit_s.floatParsFinal() if use_s else None
+    fpf_b = fit_b.floatParsFinal() if use_b else None
 
     names = set()
-    for pf in _iter_argset(fpf_s): names.add(pf.GetName())
-    for pf in _iter_argset(fpf_b): names.add(pf.GetName())
+    if fpf_s is not None:
+        for pf in _iter_argset(fpf_s):
+            names.add(pf.GetName())
+    if fpf_b is not None:
+        for pf in _iter_argset(fpf_b):
+            names.add(pf.GetName())
     names -= poi_set
     if not names:
         raise RuntimeError("No floating nuisance parameters after excluding POIs: "
@@ -161,16 +187,25 @@ def build_rows(fit_s, fit_b, prefit,
         method = ("gaussian" if has_sigma0 else "no_prefit_sigma")
 
         # --- postfit ---
-        ns = fpf_s.find(name)
-        nb = fpf_b.find(name)
+        ns = fpf_s.find(name) if fpf_s is not None else None
+        nb = fpf_b.find(name) if fpf_b is not None else None
 
         theta_s = ns.getVal() if ns else float("nan")
         err_s   = ns.getError() if ns else float("nan")
         theta_b = nb.getVal() if nb else float("nan")
         err_b   = nb.getError() if nb else float("nan")
+        dropped_s = _is_robusthesse_dropped(ns)
+        dropped_b = _is_robusthesse_dropped(nb)
 
-        if not (math.isfinite(theta_s) or math.isfinite(theta_b)):
-            raise RuntimeError(f"Postfit value missing for '{name}' in both fit_s and fit_b")
+        if use_s and use_b:
+            if not (math.isfinite(theta_s) or math.isfinite(theta_b)):
+                raise RuntimeError(f"Postfit value missing for '{name}' in both fit_s and fit_b")
+        elif use_s:
+            if not math.isfinite(theta_s):
+                raise RuntimeError(f"Postfit value missing for '{name}' in fit_s")
+        elif use_b:
+            if not math.isfinite(theta_b):
+                raise RuntimeError(f"Postfit value missing for '{name}' in fit_b")
 
         def _pull_and_err(th, er):
             if not has_sigma0:
@@ -194,23 +229,28 @@ def build_rows(fit_s, fit_b, prefit,
             sigma_hat_b=float(err_b)   if math.isfinite(err_b)   else float("nan"),
             pull_s=pull_s, err_pull_s=epull_s,
             pull_b=pull_b, err_pull_b=epull_b,
+            dropped_s=dropped_s,
+            dropped_b=dropped_b,
             method=method,
             prefit_src=prefit_src,   # (선택) 디버깅용
         ))
 
     return rows   # ✅ 이거 필수
 
-def sort_filter(rows: List[Dict[str, Any]], regex: str = "", sort: str = "abs") -> List[Dict[str, Any]]:
+def sort_filter(rows: List[Dict[str, Any]], regex: str = "", sort: str = "abs",
+                fit_mode: str = "both") -> List[Dict[str, Any]]:
     r = rows
     if regex:
         pat = re.compile(regex)
         r = [x for x in r if pat.search(x["name"])]
+    pull_key = "pull_b" if fit_mode == "b" else "pull_s"
+    err_key = "err_pull_b" if fit_mode == "b" else "err_pull_s"
     if sort == "name":
         r = sorted(r, key=lambda x: x["name"])
     elif sort == "abs":  # "abs"
-        r = sorted(r, key=lambda x: ((abs(x["pull_s"])) if math.isfinite(x["pull_s"]) else float("-inf")), reverse=True)
+        r = sorted(r, key=lambda x: ((abs(x[pull_key])) if math.isfinite(x[pull_key]) else float("-inf")), reverse=True)
     elif sort == "constraint":
-        r = sorted(r, key=lambda x: (abs(x["err_pull_s"]) if math.isfinite(x["err_pull_s"]) else float("inf")))
+        r = sorted(r, key=lambda x: (abs(x[err_key]) if math.isfinite(x[err_key]) else float("inf")))
     return r
 
 # ---------- outputs ----------
@@ -226,7 +266,7 @@ def write_csv(rows: List[Dict[str, Any]], out_csv: str):
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            row = dict(r)
+            row = {k: r.get(k) for k in fields}
             for k in ["theta0","sigma0","theta_hat_s","sigma_hat_s","pull_s","err_pull_s",
                       "theta_hat_b","sigma_hat_b","pull_b","err_pull_b"]:
                 v = row.get(k)
@@ -235,23 +275,39 @@ def write_csv(rows: List[Dict[str, Any]], out_csv: str):
             w.writerow(row)
 
 def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
-         xlim: Tuple[float,float], sort: str) -> Tuple[List[str], int, int]:
+         xlim: Tuple[float,float], sort: str, fit_mode: str = "both") -> Tuple[List[str], int, int, int]:
     os.makedirs(os.path.dirname(out_pdf) or ".", exist_ok=True)
+    show_s = _use_s_fit(fit_mode)
+    show_b = _use_b_fit(fit_mode)
 
     def _has_any_postfit(r):
-        return (math.isfinite(r["theta_hat_s"]) and math.isfinite(r["sigma_hat_s"])) or \
-               (math.isfinite(r["theta_hat_b"]) and math.isfinite(r["sigma_hat_b"]))
+        has_s = show_s and math.isfinite(r["theta_hat_s"]) and math.isfinite(r["sigma_hat_s"])
+        has_b = show_b and math.isfinite(r["theta_hat_b"]) and math.isfinite(r["sigma_hat_b"])
+        return has_s or has_b
+
+    def _is_robusthesse_dropped_row(r):
+        return (show_s and r.get("dropped_s", False)) or (show_b and r.get("dropped_b", False))
 
     # ✅ pull 있거나, no_prefit_sigma인데 postfit 숫자 있으면 유지
     finite_rows = []
+    dropped_nonfinite = 0
+    dropped_robusthesse = 0
     for r in rows:
-        if math.isfinite(r["pull_s"]) or math.isfinite(r["pull_b"]):
+        if _is_robusthesse_dropped_row(r):
+            dropped_robusthesse += 1
+            continue
+
+        has_pull_s = show_s and math.isfinite(r["pull_s"])
+        has_pull_b = show_b and math.isfinite(r["pull_b"])
+        if has_pull_s or has_pull_b:
             finite_rows.append(r)
         elif r.get("method") == "no_prefit_sigma" and _has_any_postfit(r):
             finite_rows.append(r)
+        else:
+            dropped_nonfinite += 1
 
     if len(finite_rows) == 0:
-        raise RuntimeError("No entries to display (no finite pulls and no postfit-only entries).")
+        raise RuntimeError("No entries to display (all entries are non-finite or robustHesse-dropped).")
 
     pages = [finite_rows[i:i+chunk] for i in range(0, len(finite_rows), chunk)]
     with PdfPages(out_pdf) as pdf:
@@ -268,8 +324,10 @@ def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
 
             fig, ax = plt.subplots(figsize=(10, max(6, 0.32*len(page)+2)))
 
-            ax.errorbar(pull_s, y, xerr=epull_s, fmt="o", capsize=2, elinewidth=1, linewidth=0.8, label="S+B")
-            ax.errorbar(pull_b, y, xerr=epull_b, fmt="^", capsize=2, elinewidth=1, linewidth=0.8, label="B-only")
+            if show_s:
+                ax.errorbar(pull_s, y, xerr=epull_s, fmt="o", capsize=2, elinewidth=1, linewidth=0.8, label="S+B")
+            if show_b:
+                ax.errorbar(pull_b, y, xerr=epull_b, fmt="^", capsize=2, elinewidth=1, linewidth=0.8, label="B-only")
 
             def _fmt(v):
                 return "nan" if (not isinstance(v, float) or not math.isfinite(v)) else f"{v:.2g}"
@@ -291,7 +349,7 @@ def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
                 is_postonly = (r.get("method") == "no_prefit_sigma")
 
                 if not is_postonly:
-                    if isinstance(ps, float) and math.isfinite(ps) and isinstance(es, float) and math.isfinite(es):
+                    if show_s and isinstance(ps, float) and math.isfinite(ps) and isinstance(es, float) and math.isfinite(es):
                         xe = _right_end(ps, es)
                         ax.annotate(
                             f"S+B: {_fmt(ps)}±{_fmt(es)}",
@@ -300,7 +358,7 @@ def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
                             ha="left", va="center",
                             fontsize=7, alpha=0.9, clip_on=True,
                         )
-                    if isinstance(pb, float) and math.isfinite(pb) and isinstance(eb, float) and math.isfinite(eb):
+                    if show_b and isinstance(pb, float) and math.isfinite(pb) and isinstance(eb, float) and math.isfinite(eb):
                         xe = _right_end(pb, eb)
                         ax.annotate(
                             f"B: {_fmt(pb)}±{_fmt(eb)}",
@@ -312,9 +370,9 @@ def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
                 else:
                     xr = (xlim[0] + xlim[1]) / 2
                     lines = []
-                    if math.isfinite(r["theta_hat_s"]) and math.isfinite(r["sigma_hat_s"]):
+                    if show_s and math.isfinite(r["theta_hat_s"]) and math.isfinite(r["sigma_hat_s"]):
                         lines.append(f"S+B: {_fmt(r['theta_hat_s'])}±{_fmt(r['sigma_hat_s'])}")
-                    if math.isfinite(r["theta_hat_b"]) and math.isfinite(r["sigma_hat_b"]):
+                    if show_b and math.isfinite(r["theta_hat_b"]) and math.isfinite(r["sigma_hat_b"]):
                         lines.append(f"B: {_fmt(r['theta_hat_b'])}±{_fmt(r['sigma_hat_b'])}")
                     txt = " / ".join(lines) if lines else "postfit: (missing)"
                     ax.annotate(
@@ -341,8 +399,7 @@ def plot(rows: List[Dict[str, Any]], out_pdf: str, cms_label: str, chunk: int,
             plt.close(fig)
 
     kept = len(finite_rows)
-    dropped = len(rows) - kept
-    return [out_pdf], kept, dropped
+    return [out_pdf], kept, dropped_nonfinite, dropped_robusthesse
 
 # ---------- main ----------
 def main():
@@ -362,6 +419,8 @@ def main():
     ap.add_argument("--chunk", type=int, default=50, help="Number of nuisances per page")
     ap.add_argument("--poi", default="r",
                 help="Comma-separated POI names to EXCLUDE from nuisances (default: 'r')")
+    ap.add_argument("--fit-mode", choices=["both", "s", "b"], default="both",
+                help="Which fit result(s) to use for sorting and plotting")
     args = ap.parse_args()
 
     try:
@@ -370,7 +429,7 @@ def main():
     except Exception:
         xl = (-3.5, 3.5)
 
-    fit_s, fit_b, prefit = read_fit(args.input)
+    fit_s, fit_b, prefit = read_fit(args.input, fit_mode=args.fit_mode)
 
     # --- 워크스페이스에서 prefit 가져오기 (선택) ---
     prefit_map = None
@@ -384,18 +443,24 @@ def main():
 
     rows = build_rows(fit_s, fit_b, prefit,
                     prefit_map=prefit_map,
-                    poi_set=poi_set)
+                    poi_set=poi_set,
+                    fit_mode=args.fit_mode)
 
     print(f"Found {len(rows)} nuisances in total")
 
-    rows = sort_filter(rows, regex=args.regex, sort=args.sort)
+    rows = sort_filter(rows, regex=args.regex, sort=args.sort, fit_mode=args.fit_mode)
     print(f"{len(rows)} nuisances after filtering with '{args.regex}'")
 
     write_csv(rows, args.out + ".csv")
 
     out_pdf = args.out + ".pdf"
-    outs, kept, dropped = plot(rows, out_pdf, args.cms_label, args.chunk, xl, args.sort)
-    print(f"Plotted {kept} nuisances (dropped {dropped} non-finite).")
+    outs, kept, dropped_nonfinite, dropped_robusthesse = plot(
+        rows, out_pdf, args.cms_label, args.chunk, xl, args.sort, fit_mode=args.fit_mode
+    )
+    print(
+        f"Plotted {kept} nuisances "
+        f"(dropped {dropped_nonfinite} non-finite, {dropped_robusthesse} robustHesse-dropped)."
+    )
     print("Wrote:", ", ".join(outs + [args.out + ".csv"]))
 
 if __name__ == "__main__":

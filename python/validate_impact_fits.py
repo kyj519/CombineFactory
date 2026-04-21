@@ -36,6 +36,17 @@ def main():
     parser.add_argument("--glob", required=True, dest="pattern", help="Glob for fit ROOT files")
     parser.add_argument("--expected", type=int, default=0, help="Expected number of fit files")
     parser.add_argument("--min-entries", type=int, default=1, help="Minimum entries required in limit tree")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only print summary status, not per-file failure details",
+    )
+    parser.add_argument(
+        "--max-bad",
+        type=int,
+        default=20,
+        help="Maximum number of bad files to print when not using --summary-only",
+    )
     args = parser.parse_args()
 
     files = sorted(glob.glob(args.pattern))
@@ -54,8 +65,11 @@ def main():
 
     if bad:
         print(f"[ERR] {len(bad)}/{len(files)} impact fit files are not readable yet:", file=sys.stderr)
-        for path, detail in bad:
-            print(f"  {os.path.basename(path)}: {detail}", file=sys.stderr)
+        if not args.summary_only:
+            for path, detail in bad[: max(0, args.max_bad)]:
+                print(f"  {os.path.basename(path)}: {detail}", file=sys.stderr)
+            if args.max_bad >= 0 and len(bad) > args.max_bad:
+                print(f"  ... and {len(bad) - args.max_bad} more", file=sys.stderr)
         return 1
 
     print(f"[ok] Validated {len(files)} impact fit files")

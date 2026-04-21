@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Add 5FS_VS_4FS shape systematics for BB_ / CC_ / JJ_ processes
-by copying **all TH1 histograms** under each process directory.
+Add 5FS-vs-4FS shape systematics for BB-like / CC_ / JJ_ processes
+by copying the immediate TH1 histograms found in each process directory.
 
-Rules:
-- BB_* : Up <- 4FS Nominal, Down <- 5FS Nominal
-- CC_* : Up <- 5FS Nominal, Down <- 5FS Nominal   (no 4FS usage)
-- JJ_* : Up <- 4FS Nominal (scaled by SCALE_TTJJ_UP), Down <- 5FS Nominal
+Implemented rules (SHAPE-ONLY):
+- BB-like (BB_* and bbDPS_BB variants):
+  Up <- 4FS Nominal/process scaled by SCALE_TTBB (matching 5FS yield), Down <- 5FS Nominal/process
+  For non-DPS BB processes, the matching BB_DPS 4FS process is added when present (Toggleable).
+- CC_* : Up <- 5FS Nominal/process (Scale 1.0, identical shape), Down <- 5FS Nominal/process
+- JJ_* : Up <- 4FS Nominal/process scaled by SCALE_TTJJ (matching 5FS yield), Down <- 5FS Nominal/process
+
+If the matching 4FS region/process is missing, only the Up variation for
+BB-like / JJ_* is skipped; Down is still written from the 5FS nominal shapes.
 
 Dry-run and verbose logging supported.
 """
@@ -22,49 +27,75 @@ import ROOT
 ROOT.PyConfig.IgnoreCommandLineOptions = True
 ROOT.gROOT.SetBatch(True)
 
+# ----------------------------- Cross Sections -----------------------------
+print("=== Cross Sections & K-factors ===")
 XSEC_TTLL_TTLJ = 453.63
+print(f"XSEC_TTLL_TTLJ: {XSEC_TTLL_TTLJ}")
+
 XSEC_TTCC_5FS = 35.08476781
 XSEC_TTCC_4FS = 35.08476781 # Same in 4FS and 5FS
+print(f"XSEC_TTCC (5FS/4FS): {XSEC_TTCC_5FS}")
+
 XSEC_TTBB_5FS = 10.45013377
-XSEC_TTBB_4FS = 11.88129415
-SCALE_TTBB_5FS = 1.36
-SCALE_TTCC_5FS = 1.11
+XSEC_TTBB_4FS_OPENLOOPS = 12.3957
+XSEC_TTBB_4FS_DPS = 1.1106
+XSEC_TTBB_4FS = XSEC_TTBB_4FS_OPENLOOPS + XSEC_TTBB_4FS_DPS
+print(f"XSEC_TTBB_5FS: {XSEC_TTBB_5FS}")
+print(f"XSEC_TTBB_4FS: {XSEC_TTBB_4FS} (OpenLoops: {XSEC_TTBB_4FS_OPENLOOPS} + DPS: {XSEC_TTBB_4FS_DPS})")
+
+SCALE_TTBB_5FS = 1.00
+SCALE_TTCC_5FS = 1.00
 SCALE_TTBB_4FS = 1.00
-SCALE_TTCC_4FS = 1.11
+SCALE_TTCC_4FS = 1.00
+print(f"SCALE_TTBB_5FS (K-factor): {SCALE_TTBB_5FS}")
+print(f"SCALE_TTBB_4FS (K-factor): {SCALE_TTBB_4FS}")
+print(f"SCALE_TTCC_5FS (K-factor): {SCALE_TTCC_5FS}")
+print(f"SCALE_TTCC_4FS (K-factor): {SCALE_TTCC_4FS}\n")
 
-# Scale factor multiplied on 4FS histograms. When 4FS copied to 5FS, they scaled by 5FS datacard setting, hence we need to adjust.
 
+# ----------------------------- Normalization ------------------------------
+print("=== Normalization Calculation (Shape-Only) ===")
 FMT = ".10g" 
 
+# 5FS와 4FS에서의 JJ(Light Jets) 비율(Fraction) 계산
 expr_5fs = (
     f"({XSEC_TTLL_TTLJ:{FMT}} - {SCALE_TTBB_5FS:{FMT}}*{XSEC_TTBB_5FS:{FMT}} "
     f"- {SCALE_TTCC_5FS:{FMT}}*{XSEC_TTCC_5FS:{FMT}}) / "
     f"({XSEC_TTLL_TTLJ:{FMT}} - {XSEC_TTBB_5FS:{FMT}} - {XSEC_TTCC_5FS:{FMT}})"
 )
+SCALE_TTJJ_5FS = eval(expr_5fs)
+print(f"[JJ 5FS Fraction] SCALE_TTJJ_5FS = {expr_5fs}")
+print(f" -> Result: {SCALE_TTJJ_5FS:.12f}")
 
 expr_4fs = (
     f"({XSEC_TTLL_TTLJ:{FMT}} - {SCALE_TTBB_4FS:{FMT}}*{XSEC_TTBB_4FS:{FMT}} "
     f"- {SCALE_TTCC_4FS:{FMT}}*{XSEC_TTCC_4FS:{FMT}}) / "
     f"({XSEC_TTLL_TTLJ:{FMT}} - {XSEC_TTBB_4FS:{FMT}} - {XSEC_TTCC_4FS:{FMT}})"
 )
+SCALE_TTJJ_4FS = eval(expr_4fs)
+print(f"[JJ 4FS Fraction] SCALE_TTJJ_4FS = {expr_4fs}")
+print(f" -> Result: {SCALE_TTJJ_4FS:.12f}\n")
 
-val_5fs = eval(expr_5fs)
-val_4fs = eval(expr_4fs)
+# [SHAPE-ONLY SCALES] 4FS 히스토그램을 5FS의 Yield에 맞추기 위한 스케일팩터
+print("--- Final Shape-Only Scales ---")
+# 1. BB-like: (5FS Yield) / (4FS Yield)
+yield_bb_5fs = SCALE_TTBB_5FS * XSEC_TTBB_5FS
+yield_bb_4fs = SCALE_TTBB_4FS * XSEC_TTBB_4FS
+SCALE_TTBB = yield_bb_5fs / yield_bb_4fs
+print(f"1. TTBB Scale: (5FS_Yield / 4FS_Yield)")
+print(f"   5FS Yield = {SCALE_TTBB_5FS} * {XSEC_TTBB_5FS} = {yield_bb_5fs:.12f}")
+print(f"   4FS Yield = {SCALE_TTBB_4FS} * {XSEC_TTBB_4FS} = {yield_bb_4fs:.12f}")
+print(f"   SCALE_TTBB = {yield_bb_5fs:.12f} / {yield_bb_4fs:.12f} = {SCALE_TTBB:.12f}")
 
-print(f"SCALE_TTJJ_5FS = {expr_5fs} = {val_5fs:.12f}")
-print(f"SCALE_TTJJ_4FS = {expr_4fs} = {val_4fs:.12f}")
-SCALE_TTJJ_4FS = val_4fs
-SCALE_TTJJ_5FS = val_5fs
+# 2. JJ: (5FS Fraction) / (4FS Fraction)
+SCALE_TTJJ = SCALE_TTJJ_5FS / SCALE_TTJJ_4FS
+print(f"2. TTJJ Scale: (SCALE_TTJJ_5FS / SCALE_TTJJ_4FS)")
+print(f"   SCALE_TTJJ = {SCALE_TTJJ_5FS:.12f} / {SCALE_TTJJ_4FS:.12f} = {SCALE_TTJJ:.12f}")
 
-SCALE_TTJJ = SCALE_TTJJ_4FS / SCALE_TTJJ_5FS
-SCALE_TTBB = SCALE_TTBB_4FS / SCALE_TTBB_5FS
-SCALE_TTCC = SCALE_TTCC_4FS / SCALE_TTCC_5FS
-
-print(f"4FS Histograms will be scaled by:")
-print(f"  BB_* : x{SCALE_TTBB:.12f}")
-print(f"  CC_* : x{SCALE_TTCC:.12f}")
-print(f"  JJ_* : x{SCALE_TTJJ:.12f}")
-
+# 3. CC: 5FS 템플릿을 그대로 사용하므로 노말라이제이션 및 셰입 변화 없음 (1.0)
+SCALE_TTCC = 1.0
+print(f"3. TTCC Scale: 5FS -> 5FS (No Shape Change)")
+print(f"   SCALE_TTCC = {SCALE_TTCC:.12f}\n")
 
 
 # ----------------------------- Helpers ------------------------------------
@@ -82,6 +113,22 @@ def list_subdirs(tdir):
         if is_tdir(obj):
             d[obj.GetName()] = obj
     return d
+
+
+def is_bb_like_process(name):
+    return name.startswith("BB_") or "_bbDPS_BB" in name
+
+
+def is_dps_process(name):
+    return "_DPS" in name or "_bbDPS_BB" in name
+
+
+def is_cc_process(name):
+    return name.startswith("CC_")
+
+
+def is_jj_process(name):
+    return name.startswith("JJ_")
 
 
 def get_subdir(parent, name):
@@ -106,6 +153,23 @@ def ensure_subdir(parent, name, dry_run=False):
     return get_subdir(parent, name)
 
 
+def get_bb_dps_partner_name(name):
+    """Return the matching DPS process name for a non-DPS BB process."""
+    if is_dps_process(name):
+        return None
+
+    if name.startswith("BB_"):
+        for suffix in ("_45", "_4", "_2"):
+            if name.endswith(suffix):
+                return f"{name[:-len(suffix)]}_DPS{suffix}"
+        return f"{name}_DPS"
+
+    if (name.startswith("TTLJ_") or name.startswith("TTLL_")) and "_BB" in name:
+        return name.replace("_BB", "_bbDPS_BB", 1)
+
+    return None
+
+
 def list_th1_in_dir(tdir):
     """Return dict[name -> TH1] for immediate objects that are TH1."""
     out = {}
@@ -118,6 +182,20 @@ def list_th1_in_dir(tdir):
         obj = k.ReadObj()
         if isinstance(obj, ROOT.TH1):
             out[obj.GetName()] = obj
+    return out
+
+
+def list_th1_merged_from_dirs(named_dirs):
+    """Return dict[name -> TH1] summed across immediate TH1 objects in named_dirs."""
+    out = {}
+    for _, tdir in named_dirs:
+        for hname, hist in list_th1_in_dir(tdir).items():
+            if hname in out:
+                out[hname].Add(hist)
+                continue
+            clone = hist.Clone()
+            clone.SetDirectory(0)
+            out[hname] = clone
     return out
 
 
@@ -154,10 +232,8 @@ def process_one_file(fs5_path, fs4_dir, opts):
     base = os.path.basename(fs5_path)
     fs4_path = os.path.join(fs4_dir, base)
 
-    # We only need 4FS file if at least one BB_ or JJ_ exists.
-    # We'll open it anyway if present; absence will only block BB_/JJ_ Up.
     if not os.path.exists(fs4_path):
-        logging.warning("4FS file not found for %s → %s (BB_/JJ_ Up will be skipped)",
+        logging.warning("4FS file not found for %s → %s (BB-like/JJ_ Up will be skipped)",
                         base, fs4_path)
 
     logging.info("=== File: %s", base)
@@ -183,56 +259,75 @@ def process_one_file(fs5_path, fs4_dir, opts):
             n_skips += 1
             continue
 
-        # 4FS region/nominal (may be None; not needed for CC_)
         rdir4 = get_subdir(fs4, rname) if fs4 else None
         nom4 = get_subdir(rdir4, opts.nominal_dir) if rdir4 else None
 
-        # Prepare target Up/Down dirs in 5FS file
-        up_dir5   = ensure_subdir(rdir5, f"{opts.syst_name}_Up",  dry_run=opts.dry_run)
+        up_dir5   = ensure_subdir(rdir5, f"{opts.syst_name}_Up",   dry_run=opts.dry_run)
         down_dir5 = ensure_subdir(rdir5, f"{opts.syst_name}_Down", dry_run=opts.dry_run)
 
         did_any_proc = False
 
         for pname, pdir5 in list_subdirs(nom5).items():
-            if not (pname.startswith("BB_") or pname.startswith("CC_") or pname.startswith("JJ_")):
+            if not (is_bb_like_process(pname) or is_cc_process(pname) or is_jj_process(pname)):
                 continue
 
-            # Decide Up source and scale
-            if pname.startswith("JJ_"):
-                up_src_dir = get_subdir(nom4, pname) if nom4 else None
+            if opts.skip_standalone_dps and is_dps_process(pname):
+                logging.debug("Region %s: skipping standalone DPS process %s", rname, pname)
+                continue
+
+            # Decide Up source(s) and scale
+            if is_jj_process(pname):
+                up_src_names = [pname]
                 up_scale = SCALE_TTJJ
                 need_4fs = True
-            elif pname.startswith("BB_"):
-                up_src_dir = get_subdir(nom4, pname) if nom4 else None
-                up_scale = 1.0
+            elif is_bb_like_process(pname):
+                up_src_names = [pname]
+                if not opts.no_dps_merge:
+                    bb_dps_partner = get_bb_dps_partner_name(pname)
+                    if bb_dps_partner:
+                        up_src_names.append(bb_dps_partner)
+                up_scale = SCALE_TTBB
                 need_4fs = True
-            else:  # CC_: always copy from 5FS Nominal (no 4FS)
-                up_src_dir = pdir5
-                up_scale = 1.0
+            else:  # CC_: use 5FS Nominal and scale by SCALE_TTCC
+                up_src_names = [pname]
+                up_scale = SCALE_TTCC
                 need_4fs = False
 
-            # Down source: always 5FS Nominal/process
+            if need_4fs:
+                up_named_dirs = []
+                missing_4fs_sources = []
+                for src_name in up_src_names:
+                    src_dir = get_subdir(nom4, src_name) if nom4 else None
+                    if src_dir is None:
+                        missing_4fs_sources.append(src_name)
+                    else:
+                        up_named_dirs.append((src_name, src_dir))
+            else:
+                up_named_dirs = [(pname, pdir5)]
+                missing_4fs_sources = []
+
             down_src_dir = pdir5
 
-            # Handle missing 4FS only when required (BB_, JJ_)
-            if need_4fs and up_src_dir is None:
+            if need_4fs and not up_named_dirs:
                 logging.warning("  Region=%s process=%s: 4FS source missing → skip Up for this process",
                                 rname, pname)
-                # Still write Down (from 5FS Nominal)
                 up_possible = False
             else:
                 up_possible = True
+                if missing_4fs_sources:
+                    logging.info("  Region=%s process=%s: missing 4FS source(s): %s",
+                                 rname, pname, ", ".join(missing_4fs_sources))
 
-            logging.info("  Region=%s process=%s (Up scale=%.10g%s)",
-                         rname, pname, up_scale, "" if up_possible else ", Up SKIPPED")
+            logging.info("  Region=%s process=%s (Up scale=%.10g%s; source(s)=%s)",
+                         rname, pname, up_scale, "" if up_possible else ", Up SKIPPED",
+                         ", ".join(src_name for src_name, _ in up_named_dirs) if up_named_dirs else "None")
 
-            # Ensure process subdirs under Up/Down
             up_pdir   = up_dir5   if up_dir5   is None else ensure_subdir(up_dir5,   pname, dry_run=opts.dry_run)
             down_pdir = down_dir5 if down_dir5 is None else ensure_subdir(down_dir5, pname, dry_run=opts.dry_run)
 
             # --- Up ---
             if up_possible:
-                hists_up_src = list_th1_in_dir(up_src_dir)
+                hists_up_src = list_th1_merged_from_dirs(up_named_dirs)
                 if not hists_up_src:
                     logging.warning("    (Up) No TH1 in source for %s/%s → skip Up", rname, pname)
                 else:
@@ -267,7 +362,11 @@ def process_one_file(fs5_path, fs4_dir, opts):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Add 5FS_VS_4FS Up/Down for BB_*, CC_*, JJ_* (copy ALL TH1). CC_* uses 5FS Nominal for both."
+        description=(
+            "Add Shape-Only 5FS-vs-4FS Up/Down systematics for BB-like, CC_*, JJ_* processes. "
+            "It copies the immediate TH1 objects and applies scales so the 4FS (Up) yield "
+            "matches the 5FS (Nominal/Down) yield exactly."
+        )
     )
     ap.add_argument("fourfs_dir", help="Directory containing 4FS ROOT files with identical file names.")
     ap.add_argument("-g", "--glob", default="*.root",
@@ -280,6 +379,12 @@ def main():
                     help="Do not modify any files; only log intended actions.")
     ap.add_argument("--force", action="store_true",
                     help="Overwrite existing histograms if they already exist.")
+    
+    ap.add_argument("--no-dps-merge", action="store_true",
+                    help="Disable merging of 4FS DPS partner histograms into base BB processes.")
+    ap.add_argument("--skip-standalone-dps", action="store_true",
+                    help="Skip standalone _DPS processes entirely to avoid empty 5FS Down warnings.")
+
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="Increase verbosity (-v: INFO, -vv: DEBUG)")
 
@@ -307,7 +412,7 @@ def main():
         for k in totals:
             totals[k] += res.get(k, 0)
 
-    print("=== Summary ===")
+    print("\n=== Summary ===")
     print(f" files:     {totals['files']}")
     print(f" regions:   {totals['regions']}")
     print(f" processes: {totals['procs']}")
@@ -316,7 +421,6 @@ def main():
     print(f" skips:     {totals['skips']}")
     if opts.dry_run:
         print(" (dry-run: nothing was written)")
-    print(f" JJ Up scale factor = {SCALE_TTJJ:.12f}")
 
 
 if __name__ == "__main__":

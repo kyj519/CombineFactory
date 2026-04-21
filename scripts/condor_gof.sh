@@ -4,7 +4,7 @@ set -e
 
 CMSSW_BASE="/data6/Users/yeonjoon/combine/CMSSW_14_1_0_pre4/src"
 DEFAULT_WORKDIR="${CMSSW_BASE}/CombineFactory/RunIIVcb/BTag_7Class_01_JESBreakdown_Big_5f_AfterHEMFIX_AddBin/GOF"
-DEFAULT_DATACARD="../SR_SL_DL2.root"
+DEFAULT_DATACARD="../SR_SL_DL.root"
 DEFAULT_TOYS=5
 DEFAULT_TAG="_result_bonly_CRonly_toy"
 

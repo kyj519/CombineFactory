@@ -100,6 +100,39 @@ def update_group_lines(lines: list[str], old_name: str, new_name: str) -> list[s
     return updated
 
 
+def make_empty_yields(categories: list[str]) -> dict[str, dict[str, float]]:
+    return {cat: {'nominal': 0.0, 'up': 0.0, 'down': 0.0} for cat in categories}
+
+
+def is_total_ttlj_process(process_name: str) -> bool:
+    return process_name == "WtoCB" or ("TTLJ" in process_name and "TTLL" not in process_name)
+
+
+def compute_symm_lnn(nominal: float, up: float, down: float) -> tuple[str, str]:
+    if nominal <= 1e-9:
+        return "-", "-"
+
+    ratio_up = up / nominal
+    ratio_down = down / nominal
+    up_down_ratios_str = f"{ratio_up:.4f}/{ratio_down:.4f}"
+
+    def to_factor(ratio: float) -> float:
+        if ratio < 1e-9:
+            return float('inf')
+        return ratio if ratio >= 1.0 else 1.0 / ratio
+
+    max_factor = max(to_factor(ratio_up), to_factor(ratio_down))
+
+    if max_factor == float('inf'):
+        symm_lnN = "1000.0"
+    elif abs(max_factor - 1.0) < 1e-9:
+        symm_lnN = "-"
+    else:
+        symm_lnN = f"{max_factor:.4f}"
+
+    return symm_lnN, up_down_ratios_str
+
+
 def main():
     """Main execution function."""
     args = parse_args()
@@ -181,7 +214,8 @@ def main():
         console.print(f"[yellow]Warning:[/] No processes seem to be affected by the systematic '{args.systematic}'. No changes will be made.")
         sys.exit(0)
 
-    yields = {p: {cat: {'nominal': 0.0, 'up': 0.0, 'down': 0.0} for cat in categories} for p in affected_processes}
+    yields = {p: make_empty_yields(categories) for p in affected_processes}
+    total_ttlj_yields = make_empty_yields(categories)
     
     open_files = {}
     try:
@@ -196,12 +230,17 @@ def main():
             process = col['process']
             nominal_rate = col['rate']
             col_idx = col['col_idx']
+            applies_to_col = col_idx < len(shape_line_values) and shape_line_values[col_idx] not in ('-', '0')
             
             yields[process][category]['nominal'] += nominal_rate
             yields[process][category]['up'] += nominal_rate
             yields[process][category]['down'] += nominal_rate
+            if applies_to_col and is_total_ttlj_process(process):
+                total_ttlj_yields[category]['nominal'] += nominal_rate
+                total_ttlj_yields[category]['up'] += nominal_rate
+                total_ttlj_yields[category]['down'] += nominal_rate
 
-            if col_idx < len(shape_line_values) and shape_line_values[col_idx] not in ('-', '0'):
+            if applies_to_col:
                 info = shapes_info.get(col['bin']) or shapes_info.get('*')
                 if not info:
                     console.print(f"[bold red]Error:[/] No shapes rule found for bin '{col['bin']}'.")
@@ -231,9 +270,14 @@ def main():
                 if nom_hist_yield > 0:
                     up_ratio = up_hist_yield / nom_hist_yield
                     down_ratio = down_hist_yield / nom_hist_yield
-                    
-                    yields[process][category]['up'] += nominal_rate * (up_ratio - 1.0)
-                    yields[process][category]['down'] += nominal_rate * (down_ratio - 1.0)
+                    up_delta = nominal_rate * (up_ratio - 1.0)
+                    down_delta = nominal_rate * (down_ratio - 1.0)
+
+                    yields[process][category]['up'] += up_delta
+                    yields[process][category]['down'] += down_delta
+                    if is_total_ttlj_process(process):
+                        total_ttlj_yields[category]['up'] += up_delta
+                        total_ttlj_yields[category]['down'] += down_delta
     finally:
         for f in open_files.values():
             f.close()
@@ -247,43 +291,63 @@ def main():
     table.add_column("Symm. lnN", justify="center", style="yellow")
 
     lnN_values = {p: {} for p in affected_processes}
+    ratio_strings = {p: {} for p in affected_processes}
+
+    for process in affected_processes:
+        for cat in categories:
+            nom = yields[process][cat]['nominal']
+            up = yields[process][cat]['up']
+            down = yields[process][cat]['down']
+            lnN_values[process][cat], ratio_strings[process][cat] = compute_symm_lnn(nom, up, down)
+
+    total_ttlj_lnN = {}
+    total_ttlj_ratios = {}
+    for cat in categories:
+        nom = total_ttlj_yields[cat]['nominal']
+        up = total_ttlj_yields[cat]['up']
+        down = total_ttlj_yields[cat]['down']
+        total_ttlj_lnN[cat], total_ttlj_ratios[cat] = compute_symm_lnn(nom, up, down)
+
+    fallback_notes = []
+    if "WtoCB" in lnN_values:
+        for cat in categories:
+            if yields["WtoCB"][cat]['nominal'] <= 1e-9:
+                continue
+            if lnN_values["WtoCB"][cat] != "-":
+                continue
+            if total_ttlj_yields[cat]['nominal'] <= 1e-9 or total_ttlj_lnN[cat] == "-":
+                continue
+
+            lnN_values["WtoCB"][cat] = total_ttlj_lnN[cat]
+            ratio_strings["WtoCB"][cat] = total_ttlj_ratios[cat]
+            fallback_notes.append((cat, total_ttlj_ratios[cat], total_ttlj_lnN[cat]))
 
     for process in affected_processes:
         for i, cat in enumerate(categories):
-            nom, up, down = yields[process][cat]['nominal'], yields[process][cat]['up'], yields[process][cat]['down']
-            
+            nom = yields[process][cat]['nominal']
             process_label = process if i == 0 else ""
             is_last_cat_for_proc = (i == len(categories) - 1)
 
             if nom > 1e-9:
-                ratio_up = up / nom
-                ratio_down = down / nom
-                
-                up_down_ratios_str = f"{ratio_up:.4f}/{ratio_down:.4f}"
-
-                def to_factor(r):
-                    if r < 1e-9: return float('inf')
-                    return r if r >= 1.0 else 1.0/r
-
-                max_factor = max(to_factor(ratio_up), to_factor(ratio_down))
-                
-                if max_factor == float('inf'):
-                    symm_lnN = "1000.0" # A large number for infinite variation
-                elif abs(max_factor - 1.0) < 1e-9:
-                    symm_lnN = "-"
-                else:
-                    symm_lnN = f"{max_factor:.4f}"
-                
-                lnN_values[process][cat] = symm_lnN
-                
-                table.add_row(process_label, cat, f"{nom:,.3f}", up_down_ratios_str, symm_lnN, end_section=is_last_cat_for_proc)
+                table.add_row(
+                    process_label,
+                    cat,
+                    f"{nom:,.3f}",
+                    ratio_strings[process][cat],
+                    lnN_values[process][cat],
+                    end_section=is_last_cat_for_proc,
+                )
             else:
-                lnN_values[process][cat] = "-"
                 table.add_row(process_label, cat, f"{nom:,.3f}", "-", "-", end_section=is_last_cat_for_proc)
 
     console.print(table)
+    for cat, ratio_str, symm_lnN in fallback_notes:
+        console.print(
+            f"[yellow]Fallback:[/] WtoCB {cat} used total TTLJ variation "
+            f"({ratio_str} -> {symm_lnN})."
+        )
 
-    new_syst_name = f"{systematic_name_in_card.rstrip('_')}_byCat"
+    new_syst_name = systematic_name_in_card
     new_tokens = [new_syst_name, "lnN"]
     for col in columns:
         category = get_category(col['bin'])

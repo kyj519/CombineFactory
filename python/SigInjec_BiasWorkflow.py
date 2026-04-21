@@ -9,6 +9,7 @@ Workflow
 3) submit-fits  : submit fit jobs for each scan point
 4) plot         : run SigInjec_Plot.py for each scan point
 5) rank         : compare bias metrics and rank nuisance candidates
+6) run          : submit toys/fits, wait, and plot in one command
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ import fnmatch
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -28,6 +31,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 
 DEFAULT_EXCLUDE_REGEX = r"^(prop_bin|n_exp(_final)?_bin|mask_)"
+DEFAULT_TOY_INJECTION_TOKENS = ["0p0", "1p0", "2p0", "3p0"]
 
 
 def sanitize_name(text: str, max_len: int = 96) -> str:
@@ -381,6 +385,360 @@ def run_command(cmd: List[str], dry_run: bool = False) -> None:
     subprocess.run(cmd, check=True)
 
 
+def resolve_selection_context(
+    manifest_arg: str,
+    run_match: Optional[str],
+    limit: int,
+    skip_baseline: bool,
+) -> Tuple[Path, List[Dict[str, str]], List[Dict[str, str]], Optional[Path]]:
+    manifest = Path(manifest_arg).resolve()
+    rows = read_manifest(manifest)
+    selected = filter_manifest_rows(rows, run_match, limit, skip_baseline)
+
+    base_dir = _find_base_dir_from_manifest(manifest, rows)
+    if selected and base_dir is None:
+        print(
+            "[warn] Could not infer base_dir from manifest. run_dir will be used as-is "
+            "without workspace auto-link recovery."
+        )
+
+    return manifest, rows, selected, base_dir
+
+
+def derive_batch_prefix(batch_prefix: str, kind: str, run_id: str) -> str:
+    default_prefix = "toy" if kind == "toys" else "fit"
+    base = (batch_prefix or default_prefix).strip()
+    return sanitize_name(f"{base}_{run_id}", max_len=96)
+
+
+def build_submit_command(
+    row: Dict[str, str],
+    run_dir: Path,
+    kind: str,
+    injections: str,
+    njobs: int,
+    backend: str,
+    workers: int,
+    batch_prefix: str,
+) -> List[str]:
+    script_dir = Path(__file__).resolve().parent
+    submit_script = script_dir / ("submitToy.py" if kind == "toys" else "submitFit.py")
+    if not submit_script.is_file():
+        raise FileNotFoundError(f"script not found: {submit_script}")
+
+    cmd = [sys.executable, str(submit_script), "--dir", str(run_dir)]
+    if kind == "toys":
+        cmd.extend(["--njobs", str(njobs)])
+    if injections:
+        cmd.extend(["--injections", injections])
+
+    freeze = row.get("freeze_params", "").strip()
+    if freeze:
+        cmd.extend(["--freeze-params", freeze])
+
+    cmd.extend(["--backend", backend, "--workers", str(workers)])
+    cmd.extend(
+        [
+            "--batch-prefix",
+            derive_batch_prefix(batch_prefix, kind, row.get("run_id", run_dir.name)),
+        ]
+    )
+    return cmd
+
+
+def submit_selected_runs(
+    selected: List[Dict[str, str]],
+    base_dir: Optional[Path],
+    kind: str,
+    injections: str,
+    njobs: int,
+    dry_run: bool,
+    backend: str,
+    workers: int,
+    batch_prefix: str,
+) -> None:
+    for row in selected:
+        run_dir = _ensure_run_dir_ready(
+            row=row,
+            base_dir=base_dir,
+            workspace_name="morphedWorkspace_fitDiagnostics120.root",
+            orig_name="origWorkspace_fitDiagnostics120.root",
+        )
+        cmd = build_submit_command(
+            row=row,
+            run_dir=run_dir,
+            kind=kind,
+            injections=injections,
+            njobs=njobs,
+            backend=backend,
+            workers=workers,
+            batch_prefix=batch_prefix,
+        )
+        run_command(cmd, dry_run=dry_run)
+
+
+def plot_selected_runs(
+    selected: List[Dict[str, str]],
+    base_dir: Optional[Path],
+    outdir: str,
+    injections: str,
+    jobs: int,
+    dry_run: bool,
+) -> None:
+    script_dir = Path(__file__).resolve().parent
+    plot_script = script_dir / "SigInjec_Plot.py"
+    if not plot_script.is_file():
+        raise FileNotFoundError(f"script not found: {plot_script}")
+
+    tasks: List[Tuple[str, List[str]]] = []
+    for row in selected:
+        run_dir = _ensure_run_dir_ready(
+            row=row,
+            base_dir=base_dir,
+            workspace_name="morphedWorkspace_fitDiagnostics120.root",
+            orig_name="origWorkspace_fitDiagnostics120.root",
+        )
+        run_id = row.get("run_id", run_dir.name)
+        cmd = [
+            sys.executable,
+            str(plot_script),
+            str(run_dir),
+            "--outdir",
+            outdir,
+        ]
+        tokens = parse_injection_tokens(injections)
+        if tokens:
+            dirs = [f"toys_Injec{token}" for token in tokens]
+            cmd.extend(["--dirs", *dirs])
+        tasks.append((run_id, cmd))
+
+    if dry_run or jobs == 1:
+        for run_id, cmd in tasks:
+            if jobs > 1:
+                print(f"[plot] {run_id}")
+            run_command(cmd, dry_run=dry_run)
+        return
+
+    print(f"[info] plot parallel jobs={jobs} selected={len(tasks)}")
+    failures: List[Tuple[str, int, List[str]]] = []
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        future_map = {
+            pool.submit(subprocess.run, cmd, check=False): (run_id, cmd)
+            for run_id, cmd in tasks
+        }
+        for fut in as_completed(future_map):
+            run_id, cmd = future_map[fut]
+            proc = fut.result()
+            if proc.returncode == 0:
+                print(f"[ok] {run_id}")
+            else:
+                print(f"[fail] {run_id} rc={proc.returncode}")
+                failures.append((run_id, proc.returncode, cmd))
+
+    if failures:
+        detail = "; ".join(
+            f"{run_id}(rc={rc})" for run_id, rc, _ in failures[:10]
+        )
+        if len(failures) > 10:
+            detail += f"; ... +{len(failures)-10} more"
+        raise RuntimeError(f"plot failed for {len(failures)} run(s): {detail}")
+
+
+def list_detected_injection_tokens(run_dir: Path) -> List[str]:
+    tokens = []
+    seen = set()
+    for toy_dir in sorted(run_dir.glob("toys_Injec*")):
+        if not toy_dir.is_dir():
+            continue
+        token = toy_dir.name.replace("toys_Injec", "", 1)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def resolve_wait_tokens(kind: str, raw_injections: str, run_dir: Path) -> List[str]:
+    tokens = parse_injection_tokens(raw_injections)
+    if tokens:
+        return tokens
+    if kind == "toys":
+        return list(DEFAULT_TOY_INJECTION_TOKENS)
+    return list_detected_injection_tokens(run_dir)
+
+
+def count_toy_root_files(run_dir: Path, token: str) -> int:
+    toy_dir = run_dir / f"toys_Injec{token}"
+    if not toy_dir.is_dir():
+        return 0
+    pattern = f"higgsCombine.Injec{token}.GenerateOnly.mH120.*.root"
+    return sum(1 for _ in toy_dir.glob(pattern))
+
+
+def count_fit_root_files(run_dir: Path, token: str) -> int:
+    toy_dir = run_dir / f"toys_Injec{token}"
+    if not toy_dir.is_dir():
+        return 0
+    return sum(1 for _ in toy_dir.glob("fitDiagnostics*.root"))
+
+
+def query_active_condor_batches() -> Optional[set[str]]:
+    condor_q = shutil.which("condor_q")
+    if not condor_q:
+        return None
+
+    user = os.environ.get("USER", "").strip()
+    names: set[str] = set()
+    got_response = False
+    for attr in ("JobBatchName", "BatchName"):
+        cmd = [condor_q]
+        if user:
+            cmd.append(user)
+        cmd.extend(["-af", attr])
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if proc.returncode != 0:
+            continue
+        got_response = True
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line:
+                names.add(line)
+    if not got_response:
+        return None
+    return names
+
+
+def build_wait_tasks(
+    selected: List[Dict[str, str]],
+    base_dir: Optional[Path],
+    kind: str,
+    injections: str,
+    njobs: int,
+    batch_prefix: str,
+) -> List[Dict[str, object]]:
+    tasks: List[Dict[str, object]] = []
+    for row in selected:
+        run_dir = _ensure_run_dir_ready(
+            row=row,
+            base_dir=base_dir,
+            workspace_name="morphedWorkspace_fitDiagnostics120.root",
+            orig_name="origWorkspace_fitDiagnostics120.root",
+        )
+        run_id = row.get("run_id", run_dir.name)
+        tokens = resolve_wait_tokens(kind=kind, raw_injections=injections, run_dir=run_dir)
+        if not tokens:
+            print(f"[warn] {run_id}: no injection tokens found for wait-{kind}")
+            continue
+
+        prefix = derive_batch_prefix(batch_prefix, kind, run_id)
+        for token in tokens:
+            expected = njobs if kind == "toys" else count_toy_root_files(run_dir, token)
+            if kind == "fits" and expected <= 0:
+                print(f"[warn] {run_id}: no toy ROOT files for Injec{token}; skip fit wait")
+                continue
+            tasks.append(
+                {
+                    "run_id": run_id,
+                    "run_dir": run_dir,
+                    "token": token,
+                    "expected": expected,
+                    "batch_name": f"{prefix}_{token}",
+                    "seen_batch": False,
+                }
+            )
+    return tasks
+
+
+def wait_for_selected_runs(
+    selected: List[Dict[str, str]],
+    base_dir: Optional[Path],
+    kind: str,
+    injections: str,
+    njobs: int,
+    backend: str,
+    batch_prefix: str,
+    poll_seconds: int,
+    wait_timeout: int,
+) -> None:
+    tasks = build_wait_tasks(
+        selected=selected,
+        base_dir=base_dir,
+        kind=kind,
+        injections=injections,
+        njobs=njobs,
+        batch_prefix=batch_prefix,
+    )
+    if not tasks:
+        print(f"[info] no wait-{kind} tasks")
+        return
+
+    count_fn = count_toy_root_files if kind == "toys" else count_fit_root_files
+    start_time = time.time()
+    remaining = tasks
+
+    while remaining:
+        if wait_timeout > 0 and time.time() - start_time > wait_timeout:
+            preview = ", ".join(
+                f"{task['run_id']}/Injec{task['token']}" for task in remaining[:8]
+            )
+            if len(remaining) > 8:
+                preview += ", ..."
+            raise TimeoutError(
+                f"wait-{kind} timed out after {wait_timeout}s for {len(remaining)} task(s): {preview}"
+            )
+
+        active_batches = query_active_condor_batches() if backend == "condor" else None
+        next_remaining: List[Dict[str, object]] = []
+        waiting_lines: List[str] = []
+
+        for task in remaining:
+            run_id = str(task["run_id"])
+            run_dir = Path(task["run_dir"])
+            token = str(task["token"])
+            expected = int(task["expected"])
+            batch_name = str(task["batch_name"])
+            count = count_fn(run_dir, token)
+
+            batch_active = False
+            if active_batches is not None and batch_name in active_batches:
+                task["seen_batch"] = True
+                batch_active = True
+
+            seen_batch = bool(task["seen_batch"])
+            if expected <= 0:
+                print(f"[done] wait-{kind} {run_id}/Injec{token}: nothing expected")
+                continue
+
+            if count >= expected and (not seen_batch or not batch_active):
+                print(f"[done] wait-{kind} {run_id}/Injec{token}: {count}/{expected}")
+                continue
+
+            if active_batches is not None and seen_batch and not batch_active and count < expected:
+                raise RuntimeError(
+                    f"wait-{kind} incomplete after batch finished for {run_id}/Injec{token}: "
+                    f"{count}/{expected} (batch={batch_name})"
+                )
+
+            if batch_active:
+                state = "batch-active"
+            elif active_batches is None:
+                state = "count-only"
+            else:
+                state = "batch-pending"
+            waiting_lines.append(f"{run_id}/Injec{token} {count}/{expected} {state}")
+            next_remaining.append(task)
+
+        if not next_remaining:
+            break
+
+        preview = "; ".join(waiting_lines[:6])
+        if len(waiting_lines) > 6:
+            preview += f"; ... +{len(waiting_lines)-6} more"
+        print(f"[wait-{kind}] remaining={len(next_remaining)} {preview}")
+        time.sleep(max(1, int(poll_seconds)))
+        remaining = next_remaining
+
+
 def _to_float(value: str, default: float = float("nan")) -> float:
     try:
         return float(value)
@@ -593,116 +951,126 @@ def filter_manifest_rows(
 
 
 def action_submit(args: argparse.Namespace, kind: str) -> None:
-    manifest = Path(args.manifest).resolve()
-    rows = read_manifest(manifest)
-    selected = filter_manifest_rows(rows, args.run_match, args.limit, args.skip_baseline)
+    _, _, selected, base_dir = resolve_selection_context(
+        manifest_arg=args.manifest,
+        run_match=args.run_match,
+        limit=args.limit,
+        skip_baseline=args.skip_baseline,
+    )
     if not selected:
         print("[info] no run selected")
         return
 
-    base_dir = _find_base_dir_from_manifest(manifest, rows)
-    if base_dir is None:
-        print(
-            "[warn] Could not infer base_dir from manifest. run_dir will be used as-is "
-            "without workspace auto-link recovery."
-        )
-
-    script_dir = Path(__file__).resolve().parent
-    submit_script = script_dir / ("submitToy.py" if kind == "toys" else "submitFit.py")
-    if not submit_script.is_file():
-        raise FileNotFoundError(f"script not found: {submit_script}")
-
-    for row in selected:
-        run_dir = _ensure_run_dir_ready(
-            row=row,
-            base_dir=base_dir,
-            workspace_name="morphedWorkspace_fitDiagnostics120.root",
-            orig_name="origWorkspace_fitDiagnostics120.root",
-        )
-        cmd = [sys.executable, str(submit_script), "--dir", str(run_dir)]
-        if kind == "toys":
-            cmd.extend(["--njobs", str(args.njobs)])
-        if args.injections:
-            cmd.extend(["--injections", args.injections])
-        freeze = row.get("freeze_params", "").strip()
-        if freeze:
-            cmd.extend(["--freeze-params", freeze])
-        run_command(cmd, dry_run=args.dry_run)
+    submit_selected_runs(
+        selected=selected,
+        base_dir=base_dir,
+        kind=kind,
+        injections=args.injections,
+        njobs=getattr(args, "njobs", 0),
+        dry_run=args.dry_run,
+        backend=args.backend,
+        workers=args.workers,
+        batch_prefix=args.batch_prefix,
+    )
 
 
 def action_plot(args: argparse.Namespace) -> None:
-    manifest = Path(args.manifest).resolve()
-    rows = read_manifest(manifest)
-    selected = filter_manifest_rows(rows, args.run_match, args.limit, args.skip_baseline)
+    _, _, selected, base_dir = resolve_selection_context(
+        manifest_arg=args.manifest,
+        run_match=args.run_match,
+        limit=args.limit,
+        skip_baseline=args.skip_baseline,
+    )
     if not selected:
         print("[info] no run selected")
         return
 
-    base_dir = _find_base_dir_from_manifest(manifest, rows)
-    if base_dir is None:
-        print(
-            "[warn] Could not infer base_dir from manifest. run_dir will be used as-is "
-            "without workspace auto-link recovery."
-        )
+    plot_selected_runs(
+        selected=selected,
+        base_dir=base_dir,
+        outdir=args.outdir,
+        injections=args.injections,
+        jobs=max(1, int(args.jobs)),
+        dry_run=args.dry_run,
+    )
 
-    script_dir = Path(__file__).resolve().parent
-    plot_script = script_dir / "SigInjec_Plot.py"
-    if not plot_script.is_file():
-        raise FileNotFoundError(f"script not found: {plot_script}")
 
-    jobs = max(1, int(args.jobs))
-    tasks: List[Tuple[str, List[str]]] = []
-    for row in selected:
-        run_dir = _ensure_run_dir_ready(
-            row=row,
-            base_dir=base_dir,
-            workspace_name="morphedWorkspace_fitDiagnostics120.root",
-            orig_name="origWorkspace_fitDiagnostics120.root",
-        )
-        run_id = row.get("run_id", run_dir.name)
-        cmd = [
-            sys.executable,
-            str(plot_script),
-            str(run_dir),
-            "--outdir",
-            args.outdir,
-        ]
-        tokens = parse_injection_tokens(args.injections)
-        if tokens:
-            dirs = [f"toys_Injec{token}" for token in tokens]
-            cmd.extend(["--dirs", *dirs])
-        tasks.append((run_id, cmd))
-
-    if args.dry_run or jobs == 1:
-        for run_id, cmd in tasks:
-            if jobs > 1:
-                print(f"[plot] {run_id}")
-            run_command(cmd, dry_run=args.dry_run)
+def action_run(args: argparse.Namespace) -> None:
+    _, _, selected, base_dir = resolve_selection_context(
+        manifest_arg=args.manifest,
+        run_match=args.run_match,
+        limit=args.limit,
+        skip_baseline=args.skip_baseline,
+    )
+    if not selected:
+        print("[info] no run selected")
         return
 
-    print(f"[info] plot parallel jobs={jobs} selected={len(tasks)}")
-    failures: List[Tuple[str, int, List[str]]] = []
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        future_map = {
-            pool.submit(subprocess.run, cmd, check=False): (run_id, cmd)
-            for run_id, cmd in tasks
-        }
-        for fut in as_completed(future_map):
-            run_id, cmd = future_map[fut]
-            proc = fut.result()
-            if proc.returncode == 0:
-                print(f"[ok] {run_id}")
-            else:
-                print(f"[fail] {run_id} rc={proc.returncode}")
-                failures.append((run_id, proc.returncode, cmd))
+    print(
+        f"[info] run selected={len(selected)} backend={args.backend} "
+        f"injections={args.injections or '(submit default)'}"
+    )
 
-    if failures:
-        detail = "; ".join(
-            f"{run_id}(rc={rc})" for run_id, rc, _ in failures[:10]
+    submit_selected_runs(
+        selected=selected,
+        base_dir=base_dir,
+        kind="toys",
+        injections=args.injections,
+        njobs=args.njobs,
+        dry_run=args.dry_run,
+        backend=args.backend,
+        workers=args.workers,
+        batch_prefix=args.batch_prefix,
+    )
+    if not args.dry_run:
+        wait_for_selected_runs(
+            selected=selected,
+            base_dir=base_dir,
+            kind="toys",
+            injections=args.injections,
+            njobs=args.njobs,
+            backend=args.backend,
+            batch_prefix=args.batch_prefix,
+            poll_seconds=args.poll_seconds,
+            wait_timeout=args.wait_timeout,
         )
-        if len(failures) > 10:
-            detail += f"; ... +{len(failures)-10} more"
-        raise RuntimeError(f"plot failed for {len(failures)} run(s): {detail}")
+    else:
+        print("[info] dry-run: skip wait-toys")
+
+    submit_selected_runs(
+        selected=selected,
+        base_dir=base_dir,
+        kind="fits",
+        injections=args.injections,
+        njobs=0,
+        dry_run=args.dry_run,
+        backend=args.backend,
+        workers=args.workers,
+        batch_prefix=args.batch_prefix,
+    )
+    if not args.dry_run:
+        wait_for_selected_runs(
+            selected=selected,
+            base_dir=base_dir,
+            kind="fits",
+            injections=args.injections,
+            njobs=0,
+            backend=args.backend,
+            batch_prefix=args.batch_prefix,
+            poll_seconds=args.poll_seconds,
+            wait_timeout=args.wait_timeout,
+        )
+    else:
+        print("[info] dry-run: skip wait-fits")
+
+    plot_selected_runs(
+        selected=selected,
+        base_dir=base_dir,
+        outdir=args.outdir,
+        injections=args.injections,
+        jobs=max(1, int(args.jobs)),
+        dry_run=args.dry_run,
+    )
 
 
 def action_rank(args: argparse.Namespace) -> None:
@@ -880,6 +1248,23 @@ def build_parser() -> argparse.ArgumentParser:
             default="",
             help="Comma-separated injections passed to submitToy/submitFit (e.g. '1p0').",
         )
+        p.add_argument(
+            "--backend",
+            choices=["condor", "local"],
+            default="condor",
+            help="Job backend forwarded to submitToy/submitFit.",
+        )
+        p.add_argument(
+            "--workers",
+            type=int,
+            default=0,
+            help="Local worker count forwarded to submitToy/submitFit.",
+        )
+        p.add_argument(
+            "--batch-prefix",
+            default="",
+            help="Base batch prefix; actual condor batch name includes run_id and injection.",
+        )
         p.add_argument("--dry-run", action="store_true", help="Print commands only")
         if name == "submit-toys":
             p.add_argument(
@@ -888,6 +1273,71 @@ def build_parser() -> argparse.ArgumentParser:
                 default=20,
                 help="Number of condor jobs per injection",
             )
+
+    p_run = subparsers.add_parser(
+        "run",
+        help="submit toys/fits, wait for outputs, and run SigInjec_Plot.py",
+    )
+    p_run.add_argument("--manifest", required=True, help="manifest.csv from prepare step")
+    p_run.add_argument("--run-match", default="", help="Regex to filter run_id/nuisance")
+    p_run.add_argument("--limit", type=int, default=0, help="Max runs to process (0=all)")
+    p_run.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip manifest baseline entry",
+    )
+    p_run.add_argument(
+        "--injections",
+        default="",
+        help="Comma-separated injections passed to submitToy/submitFit and plot.",
+    )
+    p_run.add_argument(
+        "--njobs",
+        type=int,
+        default=20,
+        help="Number of jobs per injection for toy generation.",
+    )
+    p_run.add_argument(
+        "--backend",
+        choices=["condor", "local"],
+        default="condor",
+        help="Job backend forwarded to submitToy/submitFit.",
+    )
+    p_run.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Local worker count forwarded to submitToy/submitFit.",
+    )
+    p_run.add_argument(
+        "--batch-prefix",
+        default="",
+        help="Base batch prefix; actual condor batch name includes run_id and injection.",
+    )
+    p_run.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=15,
+        help="Polling interval for wait stages.",
+    )
+    p_run.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=0,
+        help="Abort wait stage after this many seconds (0 means no timeout).",
+    )
+    p_run.add_argument(
+        "--outdir",
+        default="figs_toyfits",
+        help="Output subdirectory passed to SigInjec_Plot.py",
+    )
+    p_run.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of parallel run_dir workers for plot step.",
+    )
+    p_run.add_argument("--dry-run", action="store_true", help="Print commands only")
 
     p_plot = subparsers.add_parser("plot", help="run SigInjec_Plot.py for each run")
     p_plot.add_argument("--manifest", required=True, help="manifest.csv from prepare step")
@@ -967,6 +1417,8 @@ def main() -> None:
         action_submit(args, kind="toys")
     elif args.command == "submit-fits":
         action_submit(args, kind="fits")
+    elif args.command == "run":
+        action_run(args)
     elif args.command == "plot":
         action_plot(args)
     elif args.command == "rank":

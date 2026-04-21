@@ -7,7 +7,7 @@ MASS=120
 R_RANGE="0.8,1.2"
 POINTS=100                     # --algo grid 포인트 수
 ASIMOV="-t -1"               # -t -1 = Asimov
-SETPAR="r=1.0,ttbbXsec=1.36,ttccXsec=1.11"
+SETPAR="r=1.0,CMS_TOP26001_ttbbXsec=1.36,CMS_TOP26001_ttccXsec=1.11"
 FREEZPAR=""
 TAG="htt"                    # -n 접두어
 CONDOR_OPTS=""               # 예) '+JobFlavour="workday"'

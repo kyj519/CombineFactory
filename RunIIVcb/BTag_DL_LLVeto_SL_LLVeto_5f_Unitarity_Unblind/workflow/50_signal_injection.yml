@@ -1,0 +1,165 @@
+vars:
+  stage_siginj_enabled: "true"
+  siginj_submit_backend: "condor"
+  siginj_local_workers: "0"
+  siginj_njobs: "100"
+  siginj_injections: "0p0,1p0,2p0,3p0"
+  siginj_freeze_params: ""
+  siginj_toy_batch_prefix: "toy_5f_unblind"
+  siginj_fit_batch_prefix: "fit_5f_unblind"
+  siginj_outdir: "figs_toyfits"
+  siginj_lumiscale_datacard: "SR_SL_DL_lumiscale.txt"
+  siginj_lumiscale_workspace: "SR_SL_DL_lumiscale.root"
+
+steps:
+  - name: s50_01_siginj_prepare_dir
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s30_01_pull_fit_fast", "s20_04_workspace_linear"]
+    cmd: "mkdir -p SigInjec"
+
+  - name: s50_01a_siginj_make_lumiscale_datacard
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_01_siginj_prepare_dir"]
+    cmd: |
+      cp -f ${datacard_txt} ${siginj_lumiscale_datacard}
+      printf '\nlumiscale rateParam * * 1\nnuisance edit freeze lumiscale\n' >> ${siginj_lumiscale_datacard}
+
+  - name: s50_01b_siginj_build_lumiscale_workspace
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_01a_siginj_make_lumiscale_datacard"]
+    cmd: "text2workspace.py ./${siginj_lumiscale_datacard} -o ${siginj_lumiscale_workspace} -P HiggsAnalysis.CombinedLimit.VcbModel:brVcbModel --channel-masks"
+
+  - name: s50_02_siginj_import_morphed_ws
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_01b_siginj_build_lumiscale_workspace"]
+    workdir: "SigInjec"
+    cmd: "python3 ${cf_python}/importPars.py ../${siginj_lumiscale_workspace} ../fitDiagnostics${pull_tag_fast}.root --pull-source b"
+
+  - name: s50_03_siginj_submit_toys
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_02_siginj_import_morphed_ws"]
+    workdir: "SigInjec"
+    cmd: "python3 ${cf_python}/submitToy.py --dir . --njobs ${siginj_njobs} --injections \"${siginj_injections}\" --freeze-params \"${siginj_freeze_params}\" --batch-prefix ${siginj_toy_batch_prefix} --backend ${siginj_submit_backend} --workers ${siginj_local_workers}"
+
+  - name: s50_04_siginj_wait_toys
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_03_siginj_submit_toys"]
+    workdir: "SigInjec"
+    cmd: |
+      if [ "${siginj_submit_backend}" = "local" ]; then
+        echo "local backend: toy jobs already completed in submit step"
+        exit 0
+      fi
+      if ! command -v condor_q >/dev/null 2>&1; then
+        echo "condor_q not found; skip waiting for toy batches"
+        exit 0
+      fi
+      batch_active() {
+        local batch="$1"
+        condor_q "$USER" -af JobBatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        condor_q "$USER" -af BatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        return 1
+      }
+      count_toy_roots() {
+        local token="$1"
+        shopt -s nullglob
+        toy_roots=(toys_Injec${token}/higgsCombine.Injec${token}.GenerateOnly.mH120.*.root)
+        echo "${#toy_roots[@]}"
+      }
+      IFS=',' read -r -a injections <<< "${siginj_injections}"
+      for raw in "${injections[@]}"; do
+        token="$(echo "$raw" | tr -d '[:space:]')"
+        [ -n "$token" ] || continue
+        if [[ "$token" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+          token="${token//./p}"
+          token="${token//-/m}"
+        fi
+        batch="${siginj_toy_batch_prefix}_${token}"
+        while true; do
+          if batch_active "$batch"; then
+            break
+          fi
+          n_toys="$(count_toy_roots "$token")"
+          if [ "$n_toys" -ge "${siginj_njobs}" ]; then
+            echo "[wait] $batch not visible but found ${n_toys}/${siginj_njobs} toy files; continue"
+            break
+          fi
+          echo "[wait-init] $batch not visible yet (${n_toys}/${siginj_njobs} toy files)"
+          sleep 2
+        done
+        while batch_active "$batch"; do
+          echo "[wait] $batch"
+          sleep ${wait_poll_seconds}
+        done
+      done
+
+  - name: s50_05_siginj_submit_fits
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_04_siginj_wait_toys"]
+    workdir: "SigInjec"
+    cmd: "python3 ${cf_python}/submitFit.py --dir . --injections \"${siginj_injections}\" --freeze-params \"${siginj_freeze_params}\" --batch-prefix ${siginj_fit_batch_prefix} --backend ${siginj_submit_backend} --workers ${siginj_local_workers}"
+
+  - name: s50_06_siginj_wait_fits
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_05_siginj_submit_fits"]
+    workdir: "SigInjec"
+    cmd: |
+      if [ "${siginj_submit_backend}" = "local" ]; then
+        echo "local backend: fit jobs already completed in submit step"
+        exit 0
+      fi
+      if ! command -v condor_q >/dev/null 2>&1; then
+        echo "condor_q not found; skip waiting for fit batches"
+        exit 0
+      fi
+      batch_active() {
+        local batch="$1"
+        condor_q "$USER" -af JobBatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        condor_q "$USER" -af BatchName 2>/dev/null | grep -Fxq "$batch" && return 0
+        return 1
+      }
+      count_toy_roots() {
+        local token="$1"
+        shopt -s nullglob
+        toy_roots=(toys_Injec${token}/higgsCombine.Injec${token}.GenerateOnly.mH120.*.root)
+        echo "${#toy_roots[@]}"
+      }
+      count_fit_roots() {
+        local token="$1"
+        shopt -s nullglob
+        fit_roots=(toys_Injec${token}/fitDiagnostics*.root)
+        echo "${#fit_roots[@]}"
+      }
+      IFS=',' read -r -a injections <<< "${siginj_injections}"
+      for raw in "${injections[@]}"; do
+        token="$(echo "$raw" | tr -d '[:space:]')"
+        [ -n "$token" ] || continue
+        if [[ "$token" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+          token="${token//./p}"
+          token="${token//-/m}"
+        fi
+        batch="${siginj_fit_batch_prefix}_${token}"
+        while true; do
+          if batch_active "$batch"; then
+            break
+          fi
+          n_expected="$(count_toy_roots "$token")"
+          n_fits="$(count_fit_roots "$token")"
+          if [ "$n_expected" -gt 0 ] && [ "$n_fits" -ge "$n_expected" ]; then
+            echo "[wait] $batch not visible but found ${n_fits}/${n_expected} fit files; continue"
+            break
+          fi
+          echo "[wait-init] $batch not visible yet (${n_fits}/${n_expected} fit files)"
+          sleep 2
+        done
+        while batch_active "$batch"; do
+          echo "[wait] $batch"
+          sleep ${wait_poll_seconds}
+        done
+      done
+
+  - name: s50_07_siginj_plot
+    enabled: "${stage_siginj_enabled}"
+    needs: ["s50_06_siginj_wait_fits"]
+    workdir: "SigInjec"
+    cmd: "python3 ${cf_python}/SigInjec_Plot.py . --glob \"toys_Injec*\" --outdir ${siginj_outdir}"

@@ -1,0 +1,52 @@
+# Orchestrating workflow.
+# Use this from this directory:
+#   python3 ../../python/run_plot_workflow.py -c workflow.yml --list
+#   python3 ../../python/run_plot_workflow.py -c workflow.yml --mode local
+#   python3 ../../python/run_plot_workflow.py -c workflow.yml --mode dagman
+
+settings:
+  workdir: "."
+  shell: "/bin/bash"
+  log_dir: "logs/workflow"
+  default_retries: 0
+
+  dagman_dir: "dagman/workflow"
+  dagman:
+    getenv: true
+    forward_env: ["DATA6", "PYTHON3PATH"]
+    cmsenv:
+      enabled: true
+      cmssw_src: "${cmssw_src}"
+    request_cpus: 1
+    request_memory: "4GB"
+    request_disk: "4GB"
+
+vars:
+  cmssw_src: "/data6/Users/yeonjoon/combine/CMSSW_14_1_0_pre4/src"
+  cf_python: "${cmssw_src}/CombineFactory/python"
+  cf_scripts: "${cmssw_src}/CombineFactory/scripts"
+
+  datacard_txt: "SR_SL_DL.txt"
+  datacard_txt_quad: "SR_SL_DL2.txt"
+  workspace_linear: "SR_SL_DL.root"
+  workspace_quadratic: "SR_SL_DL2.root"
+
+  mask_signals_expr: "rgx{mask_Signal_.*}=1"
+  pull_tag_fast: ".pull.fast"
+  pull_tag_postfit: ".pull"
+
+  gof_obs_tag: "_result_bonly_CRonly"
+  gof_toy_tag: "_result_bonly_CRonly_toy"
+
+  wait_poll_seconds: "30"
+
+includes:
+  - workflow/10_prepare.yml
+  - workflow/20_datacard.yml
+  - workflow/30_pull_postfit.yml
+  - workflow/50_signal_injection.yml
+  - workflow/60_gof.yml
+  - workflow/70_breakdown.yml
+  - workflow/40_impacts.yml
+  - workflow/80_postfit.yml
+

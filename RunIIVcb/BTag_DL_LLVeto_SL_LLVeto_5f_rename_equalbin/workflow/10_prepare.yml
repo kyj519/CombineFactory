@@ -1,0 +1,438 @@
+vars:
+  stage_prepare_enabled: "true"
+  # Copy sources: 5f + 4f for both normal-hist and CR_DL (total 4 copies).
+  # 4f dirs are auto-derived from corresponding 5f dirs when empty.
+  prepare_source_hist_5f_dir: "$DATA6/../isyoon/Vcb_Post_Analysis/Workplace/Histo_Syst/BTag_5f_Unblind_EqualBin"
+  prepare_source_hist_4f_dir: "$DATA6/../isyoon/Vcb_Post_Analysis/Workplace/Histo_Syst/BTag_4f_Unblind_EqualBin"
+  prepare_source_crdl_5f_dir: "$DATA6/../isyoon/Vcb_Post_Analysis/Workplace/CR_DL/BTag_5f_Unitary"
+  prepare_source_crdl_4f_dir: "$DATA6/../isyoon/Vcb_Post_Analysis/Workplace/CR_DL/BTag_4f_Unitary"
+  prepare_source_hist_pattern: "Vcb_Histos_*_B_tagger.root"
+  prepare_source_crdl_pattern: "Vcb_DL_Histos_*.root"
+  prepare_source_hist_4f_pattern:  "Vcb_Histos_*_B_tagger.root"
+  prepare_source_crdl_4f_pattern: "Vcb_DL_Histos_*.root"
+
+  # Pair workspace folders for add_5fs_vs_4fs:
+  # - prepare_pair_5f_dir defaults to current working directory
+  # - prepare_pair_4f_dir auto-derived from prepare_pair_5f_dir when empty
+  prepare_pair_5f_dir: "."
+  prepare_pair_4f_dir: ""
+
+  prepare_input_glob: "Vcb*Histos*.root"
+  prepare_postproc_jobs: "32"
+  prepare_processed_glob: "*_processed.root"
+
+steps:
+  - name: s10_01_prepare_copy_hist_5f
+    enabled: "${stage_prepare_enabled}"
+    needs: []
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+      if [ ! -d "$pair5" ]; then
+        echo "5f target dir not found: $pair5" >&2
+        exit 1
+      fi
+
+      src_hist5="${prepare_source_hist_5f_dir}"
+      if [ -z "$src_hist5" ]; then
+        echo "prepare_source_hist_5f_dir is empty" >&2
+        exit 1
+      fi
+      shopt -s nullglob
+      files=( ${src_hist5}/${prepare_source_hist_pattern} )
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No source files matched: ${src_hist5}/${prepare_source_hist_pattern}" >&2
+        exit 1
+      fi
+      cp "${files[@]}" "$pair5"/
+
+  - name: s10_02_prepare_copy_crdl_5f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_01_prepare_copy_hist_5f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+      if [ ! -d "$pair5" ]; then
+        echo "5f target dir not found: $pair5" >&2
+        exit 1
+      fi
+
+      src_crdl5="${prepare_source_crdl_5f_dir}"
+      if [ -z "$src_crdl5" ]; then
+        echo "prepare_source_crdl_5f_dir is empty" >&2
+        exit 1
+      fi
+      shopt -s nullglob
+      files=( ${src_crdl5}/${prepare_source_crdl_pattern} )
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No CR_DL source files matched: ${src_crdl5}/${prepare_source_crdl_pattern}" >&2
+        exit 1
+      fi
+      cp "${files[@]}" "$pair5"/
+
+  - name: s10_03_prepare_rename_tagger_suffix_5f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_02_prepare_copy_crdl_5f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+      if [ ! -d "$pair5" ]; then
+        echo "5f target dir not found: $pair5" >&2
+        exit 1
+      fi
+      cd "$pair5"
+
+      for f in *_B_tagger*; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "${f/_B_tagger/}"
+      done
+      for f in *_C_tagger*; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "${f/_C_tagger/}"
+      done
+
+  - name: s10_04_prepare_run_postprocs_5f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_03_prepare_rename_tagger_suffix_5f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+      if [ ! -d "$pair5" ]; then
+        echo "5f target dir not found: $pair5" >&2
+        exit 1
+      fi
+      cd "$pair5"
+
+      mkdir -p logs
+      shopt -s nullglob
+      raw_files=( ${prepare_input_glob} )
+      files=()
+      for f in "${raw_files[@]}"; do
+        case "$f" in
+          *_processed*.root|*_B_tagger*.root|*_C_tagger*.root)
+            continue
+            ;;
+        esac
+        files+=( "$f" )
+      done
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No unprocessed ROOT files matched: ${prepare_input_glob}" >&2
+        exit 1
+      fi
+      parallel -j${prepare_postproc_jobs} --linebuffer --joblog logs/joblog_prepare_5f.tsv '
+        out="logs/{/.}.log"
+        f="{/}"
+
+        case "$f" in
+          *DL*)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var BvsC_3rd_4th_Jets_Unrolled \
+              --merge-json ./merge_CRDL.json \
+              --verbose >"$out" 2>&1 
+            ;;
+
+          *Mu.root)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var Template_MVA_Score \
+              --merge-json ./merge_mu.json \
+              --verbose >"$out" 2>&1 \
+            ;;
+
+          *El.root)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var Template_MVA_Score \
+              --merge-json ./merge_el.json \
+              --verbose >"$out" 2>&1 \
+            ;;
+
+          *)
+            echo "Skip: $f" >"$out" 2>&1
+            ;;
+        esac
+      ' ::: "${files[@]}"
+
+  - name: s10_05_prepare_copy_hist_4f
+    enabled: "${stage_prepare_enabled}"
+    needs: []
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+
+      pair4="${prepare_pair_4f_dir}"
+      if [ -z "$pair4" ]; then
+        pair4="${pair5/_5f/_4f}"
+        if [ "$pair4" = "$pair5" ]; then
+          pair4="${pair5/5f/4f}"
+        fi
+      fi
+      if [[ "$pair4" != /* ]]; then
+        pair4="$(cd "$pair4" && pwd)"
+      fi
+      if [ ! -d "$pair4" ]; then
+        echo "4f target dir not found: $pair4" >&2
+        exit 1
+      fi
+
+      src_hist5="${prepare_source_hist_5f_dir}"
+      src_hist4="${prepare_source_hist_4f_dir}"
+      if [ -z "$src_hist4" ]; then
+        src_hist4="${src_hist5/_5f/_4f}"
+        if [ "$src_hist4" = "$src_hist5" ]; then
+          src_hist4="${src_hist5/5f/4f}"
+        fi
+      fi
+      if [ -z "$src_hist4" ] || [ "$src_hist4" = "$src_hist5" ]; then
+        echo "Failed to derive hist 4f dir from hist 5f dir. Set prepare_source_hist_4f_dir." >&2
+        exit 1
+      fi
+      shopt -s nullglob
+      files=( ${src_hist4}/${prepare_source_hist_4f_pattern} )
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No source files matched: ${src_hist4}/${prepare_source_hist_4f_pattern}" >&2
+        exit 1
+      fi
+      cp "${files[@]}" "$pair4"/
+
+  - name: s10_06_prepare_copy_crdl_4f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_05_prepare_copy_hist_4f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+
+      pair4="${prepare_pair_4f_dir}"
+      if [ -z "$pair4" ]; then
+        pair4="${pair5/_5f/_4f}"
+        if [ "$pair4" = "$pair5" ]; then
+          pair4="${pair5/5f/4f}"
+        fi
+      fi
+      if [[ "$pair4" != /* ]]; then
+        pair4="$(cd "$pair4" && pwd)"
+      fi
+      if [ ! -d "$pair4" ]; then
+        echo "4f target dir not found: $pair4" >&2
+        exit 1
+      fi
+
+      src_crdl5="${prepare_source_crdl_5f_dir}"
+      src_crdl4="${prepare_source_crdl_4f_dir}"
+      if [ -z "$src_crdl4" ]; then
+        src_crdl4="${src_crdl5/_5f/_4f}"
+        if [ "$src_crdl4" = "$src_crdl5" ]; then
+          src_crdl4="${src_crdl5/5f/4f}"
+        fi
+      fi
+      if [ -z "$src_crdl4" ] || [ "$src_crdl4" = "$src_crdl5" ]; then
+        echo "Failed to derive CR_DL 4f dir from CR_DL 5f dir. Set prepare_source_crdl_4f_dir." >&2
+        exit 1
+      fi
+      shopt -s nullglob
+      files=( ${src_crdl4}/${prepare_source_crdl_4f_pattern} )
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No CR_DL source files matched: ${src_crdl4}/${prepare_source_crdl_4f_pattern}" >&2
+        exit 1
+      fi
+      cp "${files[@]}" "$pair4"/
+
+  - name: s10_07_prepare_rename_tagger_suffix_4f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_06_prepare_copy_crdl_4f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+
+      pair4="${prepare_pair_4f_dir}"
+      if [ -z "$pair4" ]; then
+        pair4="${pair5/_5f/_4f}"
+        if [ "$pair4" = "$pair5" ]; then
+          pair4="${pair5/5f/4f}"
+        fi
+      fi
+      if [[ "$pair4" != /* ]]; then
+        pair4="$(cd "$pair4" && pwd)"
+      fi
+      if [ ! -d "$pair4" ]; then
+        echo "4f target dir not found: $pair4" >&2
+        exit 1
+      fi
+      cd "$pair4"
+
+      for f in *_B_tagger*; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "${f/_B_tagger/}"
+      done
+      for f in *_C_tagger*; do
+        [ -e "$f" ] || continue
+        mv -f "$f" "${f/_C_tagger/}"
+      done
+
+  - name: s10_08_prepare_run_postprocs_4f
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_07_prepare_rename_tagger_suffix_4f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+
+      pair4="${prepare_pair_4f_dir}"
+      if [ -z "$pair4" ]; then
+        pair4="${pair5/_5f/_4f}"
+        if [ "$pair4" = "$pair5" ]; then
+          pair4="${pair5/5f/4f}"
+        fi
+      fi
+      if [[ "$pair4" != /* ]]; then
+        pair4="$(cd "$pair4" && pwd)"
+      fi
+      if [ ! -d "$pair4" ]; then
+        echo "4f target dir not found: $pair4" >&2
+        exit 1
+      fi
+      cd "$pair4"
+
+      mkdir -p logs
+      shopt -s nullglob
+      raw_files=( ${prepare_input_glob} )
+      files=()
+      for f in "${raw_files[@]}"; do
+        case "$f" in
+          *_processed*.root|*_B_tagger*.root|*_C_tagger*.root)
+            continue
+            ;;
+        esac
+        files+=( "$f" )
+      done
+      if [ ${#files[@]} -eq 0 ]; then
+        echo "No unprocessed ROOT files matched: ${prepare_input_glob}" >&2
+        exit 1
+      fi
+      parallel -j${prepare_postproc_jobs} --linebuffer --joblog logs/joblog_prepare_4f.tsv '
+        out="logs/{/.}.log"
+        f="{/}"
+
+        case "$f" in
+          *DL*)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var BvsC_3rd_4th_Jets_Unrolled \
+              --merge-json ./merge_CRDL.json \
+              --verbose >"$out" 2>&1 \
+            ;;
+
+          *Mu.root)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var Template_MVA_Score \
+              --merge-json ./merge_mu.json \
+              --verbose >"$out" 2>&1 \
+            ;;
+
+          *El.root)
+            python3 ${cf_python}/postprocs.py \
+              --input "{}" \
+              --var Template_MVA_Score \
+              --merge-json ./merge_el.json \
+              --verbose >"$out" 2>&1 \
+            ;;
+
+          *)
+            echo "Skip: $f" >"$out" 2>&1
+            ;;
+        esac
+      ' ::: "${files[@]}"
+
+  - name: s10_09_prepare_add_5fs_vs_4fs
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_04_prepare_run_postprocs_5f", "s10_08_prepare_run_postprocs_4f"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+
+      pair4="${prepare_pair_4f_dir}"
+      if [ -z "$pair4" ]; then
+        pair4="${pair5/_5f/_4f}"
+        if [ "$pair4" = "$pair5" ]; then
+          pair4="${pair5/5f/4f}"
+        fi
+      fi
+      if [[ "$pair4" != /* ]]; then
+        pair4="$(cd "$pair4" && pwd)"
+      fi
+
+      if [ "$pair4" = "$pair5" ]; then
+        echo "Failed to derive 4f pair dir from 5f pair dir. Set prepare_pair_4f_dir explicitly." >&2
+        exit 1
+      fi
+      if [ ! -d "$pair4" ]; then
+        echo "4f pair dir not found: $pair4" >&2
+        exit 1
+      fi
+
+      cd "$pair5"
+      python3 ${cf_python}/add_5fs_vs_4fs.py "$pair4" -g '${prepare_processed_glob}' -vv --force 
+
+  - name: s10_10_prepare_fix_qcd_tf_names
+    enabled: "${stage_prepare_enabled}"
+    needs: ["s10_09_prepare_add_5fs_vs_4fs"]
+    cmd: |
+      pair5="${prepare_pair_5f_dir}"
+      if [ -z "$pair5" ]; then
+        pair5="."
+      fi
+      if [[ "$pair5" != /* ]]; then
+        pair5="$(cd "$pair5" && pwd)"
+      fi
+      if [ ! -d "$pair5" ]; then
+        echo "5f target dir not found: $pair5" >&2
+        exit 1
+      fi
+      cd "$pair5"
+      python3 ${cf_python}/post.py

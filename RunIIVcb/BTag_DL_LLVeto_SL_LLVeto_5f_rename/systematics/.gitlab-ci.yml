@@ -1,0 +1,17 @@
+stages:
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+include:
+  - project: 'cms-analysis/general/datacard-ci'
+    ref: master
+    file: 'setup_variables.yml'
+
+yaml_format:
+  stage: test
+  tags:
+    - cvmfs
+  script:
+    - python3 -m unittest tests/test_yaml.py

@@ -4,10 +4,10 @@
 # --- user settings ------------------------------------------------------------
 INPUT=$1    # datacard/root path
 MASS=120
-R_RANGE="0.4,1.5"
+R_RANGE="0.0,2.0"
 POINTS=30                     # --algo grid 포인트 수
 ASIMOV="-t -1"               # -t -1 = Asimov
-SETPAR=$2
+SETPAR="CMS_TOP26001_ttbbXsec=1.36,CMS_TOP26001_ttccXsec=1.11,r=1"
 TAG="htt"                    # -n 접두어
 CONDOR_OPTS=""               # 예) '+JobFlavour="workday"'
 # -----------------------------------------------------------------------------

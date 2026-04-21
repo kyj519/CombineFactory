@@ -1,0 +1,68 @@
+# YAML-driven plotting workflow
+#
+# Quick start
+#   python3 ../../python/run_plot_workflow.py --config workflow.yml --list
+#   python3 ../../python/run_plot_workflow.py --config workflow.yml --mode local
+#   python3 ../../python/run_plot_workflow.py --config workflow.yml --mode dagman
+#   python3 ../../python/run_plot_workflow.py --config workflow.yml --mode dagman --submit
+#
+# Select subset
+#   python3 ../../python/run_plot_workflow.py -c workflow.yml --only pull_dl_year_split,corr_dl_2018
+#   python3 ../../python/run_plot_workflow.py -c workflow.yml --skip pernuis_ttcc
+
+settings:
+  workdir: "."
+  shell: "/bin/bash"
+  log_dir: "logs/workflow"
+  default_retries: 0
+
+  dagman_dir: "dagman/plot_workflow"
+  dagman:
+    request_cpus: 1
+    request_memory: "4GB"
+    request_disk: "4GB"
+
+vars:
+  card: "SR_SL_DL2.root"
+  pull_step_size: "0.01"
+  pull_years: "2016preVFP,2016postVFP,2017,2018"
+
+  # correlation plot
+  corr_input: "fitDiagnostics.pull.DLOnly.2018.root"
+  corr_fit: "fit_s"
+  corr_target: "B_Tag_HF_"
+  corr_threshold: "0.05"
+  corr_output: "corr.png"
+
+  # workspace names
+  ws_name: "w"
+  mc_name: "ModelConfig"
+  data_name: "data_obs"
+  obs_name: "CMS_th1x"
+  cat_name: "CMS_channel"
+  lumi: "138"
+  channel_filter: "^Control_DL_.*$"
+  pernuis_out: "pernuis_prefit_pretty"
+  nuis_filter_btag_hf: "^B_Tag_HF_$"
+  nuis_filter_ttcc: "^ttccXsec$"
+
+steps:
+  - name: pull_dl_year_split
+    enabled: true
+    needs: []
+    cmd: "./run_pull_dl_year_split.sh --card ${card} --stepSize ${pull_step_size} --years ${pull_years}"
+
+  - name: corr_dl_2018
+    enabled: true
+    needs: ["pull_dl_year_split"]
+    cmd: "python3 ../../python/plot_nuisance_correlation.py -i ${corr_input} -f ${corr_fit} -t ${corr_target} -th ${corr_threshold} -o ${corr_output}"
+
+  - name: pernuis_btag_hf
+    enabled: true
+    needs: ["pull_dl_year_split"]
+    cmd: "python3 ../../python/plot_error_bands_from_combine_ws.py --ws-file ${card} --ws-name ${ws_name} --mc-name ${mc_name} --data ${data_name} --obs ${obs_name} --cat ${cat_name} --nuis-filter '${nuis_filter_btag_hf}' --channel-filter '${channel_filter}' --out ${pernuis_out} --lumi ${lumi}"
+
+  - name: pernuis_ttcc
+    enabled: true
+    needs: ["pull_dl_year_split"]
+    cmd: "python3 ../../python/plot_error_bands_from_combine_ws.py --ws-file ${card} --ws-name ${ws_name} --mc-name ${mc_name} --data ${data_name} --obs ${obs_name} --cat ${cat_name} --nuis-filter '${nuis_filter_ttcc}' --channel-filter '${channel_filter}' --out ${pernuis_out} --lumi ${lumi}"

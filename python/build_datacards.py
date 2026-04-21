@@ -48,6 +48,10 @@ def patch_missing_syst_hists(
     if not f or f.IsZombie():
         raise RuntimeError(f"Failed to open ROOT file: {root_path}")
 
+    patched_count = 0
+    printed_count = 0
+    print_limit = 20
+
     # processes present in this era/channel
     procs = sorted(list(cb.cp().era([era]).channel([channel]).process_set()))
 
@@ -90,8 +94,12 @@ def patch_missing_syst_hists(
 
                     if f.Get(syst_path):
                         continue  # already exists
-                    
-                    print(f"[PATCH] Missing syst hist: {syst_path} (copied from {nom_path}, Int={h_nom.Integral():.2f})")
+                    patched_count += 1
+                    if printed_count < print_limit:
+                        print(f"[PATCH] Missing syst hist: {syst_path} (copied from {nom_path}, Int={h_nom.Integral():.2f})")
+                    elif printed_count == print_limit:
+                        print(f"[PATCH] Additional missing syst hist messages suppressed for {Path(root_path).name}")
+                    printed_count += 1
 
                     # clone nominal and patch
                     h_new = h_nom.Clone()
@@ -119,6 +127,11 @@ def patch_missing_syst_hists(
                     h_new.SetDirectory(0)
 
     f.Close()
+    if patched_count:
+        print(
+            f"[PATCH] Patched {patched_count} missing shape histograms "
+            f"for {Path(root_path).name} (era={era}, channel={channel})"
+        )
 
 
 def load_cfg(path: str) -> dict:
@@ -130,18 +143,194 @@ def normalize_categories(cat_list, symmetrized: bool):
     Returns:
       cats_obj: List of (id, name) tuples (for CH)
       cats_names: List of names (str)
+      cats_spec: List of category metadata dicts
     """
     if not cat_list:
-        return [], []
+        return [], [], []
     
     pairs = []
+    specs = []
     for c in cat_list:
         cid, name = c["id"], c["name"]
         if symmetrized and not name.endswith("_Symmetrized"):
             name = name + "_Symmetrized"
+        rebin = int(c.get("rebin", 1))
+        if rebin < 1:
+            raise ValueError(f"Category '{name}' has invalid rebin={rebin}; expected >= 1")
+        rebin_mode = str(c.get("rebin_mode", "error")).strip().lower()
+        if rebin_mode not in {"error", "keep", "merge", "drop"}:
+            raise ValueError(
+                f"Category '{name}' has invalid rebin_mode='{rebin_mode}'; "
+                "expected one of: error, keep, merge, drop"
+            )
+        rebin_direction = str(c.get("rebin_direction", "ltr")).strip().lower()
+        if rebin_direction not in {"ltr", "rtl"}:
+            raise ValueError(
+                f"Category '{name}' has invalid rebin_direction='{rebin_direction}'; "
+                "expected one of: ltr, rtl"
+            )
         pairs.append((int(cid), str(name)))
+        specs.append(
+            {
+                "id": int(cid),
+                "name": str(name),
+                "rebin": rebin,
+                "rebin_mode": rebin_mode,
+                "rebin_direction": rebin_direction,
+            }
+        )
     
-    return pairs, [p[1] for p in pairs]
+    return pairs, [p[1] for p in pairs], specs
+
+
+def _build_rebin_groups(nbins: int, factor: int, mode: str, direction: str):
+    """Return 0-based half-open groups describing the rebinned bins."""
+    if factor <= 1:
+        return [(i, i + 1) for i in range(nbins)]
+    if factor > nbins:
+        raise ValueError(f"rebin factor={factor} exceeds nbins={nbins}")
+
+    leftover = nbins % factor
+    if direction == "ltr":
+        groups = [(start, start + factor) for start in range(0, nbins - leftover, factor)]
+        leftover_group = (nbins - leftover, nbins) if leftover else None
+    else:
+        groups = [(start, start + factor) for start in range(leftover, nbins, factor)]
+        leftover_group = (0, leftover) if leftover else None
+
+    if not leftover_group:
+        return groups
+
+    if mode == "error":
+        raise ValueError(
+            f"nbins={nbins} is not divisible by rebin factor={factor} "
+            f"(leftover={leftover}, direction={direction})"
+        )
+    if mode == "keep":
+        return groups + [leftover_group] if direction == "ltr" else [leftover_group] + groups
+    if mode == "merge":
+        if not groups:
+            return [(0, nbins)]
+        if direction == "ltr":
+            groups[-1] = (groups[-1][0], nbins)
+        else:
+            groups[0] = (0, groups[0][1])
+        return groups
+    if mode == "drop":
+        if not groups:
+            raise ValueError(
+                f"Rebin mode 'drop' would remove all bins (nbins={nbins}, factor={factor})"
+            )
+        return groups
+    raise ValueError(f"Unsupported rebin mode: {mode}")
+
+
+def _rebin_histogram_with_leftovers(h, factor: int, mode: str, direction: str):
+    """Rebin a TH1 using explicit contiguous bin groups."""
+    import ROOT
+    from array import array
+    import uuid
+
+    if not isinstance(h, ROOT.TH1):
+        raise TypeError(f"Expected ROOT.TH1, got {type(h)}")
+
+    nbins = h.GetNbinsX()
+    groups = _build_rebin_groups(nbins, factor, mode, direction)
+    if groups == [(i, i + 1) for i in range(nbins)]:
+        out = h.Clone(f"clone_{uuid.uuid4().hex}")
+        out.SetDirectory(0)
+        out.SetName(h.GetName())
+        out.SetTitle(h.GetTitle())
+        return out
+
+    axis = h.GetXaxis()
+    edges = [axis.GetBinLowEdge(groups[0][0] + 1)]
+    edges.extend(axis.GetBinUpEdge(stop) for _, stop in groups)
+
+    out = h.Rebin(len(edges) - 1, f"rebin_{uuid.uuid4().hex}", array("d", edges))
+    if out is None:
+        raise RuntimeError(
+            f"ROOT failed to rebin histogram '{h.GetName()}' "
+            f"(factor={factor}, mode={mode}, direction={direction})"
+        )
+    out.SetDirectory(0)
+    out.SetName(h.GetName())
+    out.SetTitle(h.GetTitle())
+
+    if mode == "drop":
+        if direction == "ltr":
+            out.SetBinContent(out.GetNbinsX() + 1, 0.0)
+            out.SetBinError(out.GetNbinsX() + 1, 0.0)
+        else:
+            out.SetBinContent(0, 0.0)
+            out.SetBinError(0, 0.0)
+
+    return out
+
+
+def rebin_category_shapes(
+    root_path: str,
+    category: str,
+    hist_name: str,
+    factor: int,
+    mode: str = "error",
+    direction: str = "ltr",
+):
+    """Rebin all TH1 objects matching hist_name under the category directory."""
+    if factor <= 1:
+        return
+
+    import ROOT
+
+    ROOT.TH1.AddDirectory(False)
+
+    f_in = ROOT.TFile.Open(root_path, "UPDATE")
+    if not f_in or f_in.IsZombie():
+        raise RuntimeError(f"Failed to open ROOT file for rebinning: {root_path}")
+
+    category_dir = f_in.GetDirectory(category)
+    if not category_dir:
+        f_in.Close()
+        raise RuntimeError(
+            f"Category directory '{category}' not found in {root_path}; cannot apply rebin={factor}"
+        )
+
+    rebinned_count = 0
+
+    def _recurse(directory):
+        nonlocal rebinned_count
+        for key in directory.GetListOfKeys():
+            obj = key.ReadObj()
+            if obj.InheritsFrom("TDirectory"):
+                _recurse(obj)
+                continue
+            if not obj.InheritsFrom("TH1"):
+                continue
+            if obj.GetName() != hist_name:
+                continue
+
+            nbins = obj.GetNbinsX()
+            rebinned = _rebin_histogram_with_leftovers(obj, factor, mode, direction)
+
+            directory.cd()
+            rebinned.SetName(obj.GetName())
+            rebinned.SetTitle(obj.GetTitle())
+            rebinned.Write(obj.GetName(), ROOT.TObject.kOverwrite)
+            rebinned.SetDirectory(0)
+            rebinned_count += 1
+
+    _recurse(category_dir)
+    f_in.Close()
+
+    if rebinned_count == 0:
+        raise RuntimeError(
+            f"No histograms named '{hist_name}' were rebinned under category '{category}' in {root_path}"
+        )
+
+    print(
+        f"[REBIN] Applied rebin={factor}, mode={mode}, direction={direction} "
+        f"to {rebinned_count} histograms for category '{category}' in {Path(root_path).name}"
+    )
 
 def resolve_ref(cfg: dict, ref):
     """Simple reference resolver if needed (simplified for this version)"""
@@ -405,7 +594,7 @@ def main():
         region_name = defn["name"]
         eras = defn["eras"]
         channels = defn["channels"]
-        cats_obj, cats_names = normalize_categories(defn["categories"], symmetrized)
+        cats_obj, cats_names, cats_spec = normalize_categories(defn["categories"], symmetrized)
         
         base_bkg_key = defn.get("process_base_bkg")
         base_sig_key = defn.get("process_signal")
@@ -425,7 +614,9 @@ def main():
         
         for era in eras:
             for chn in channels:
-                for cat_id, cat_name in cats_obj:
+                for cat in cats_spec:
+                    cat_id = cat["id"]
+                    cat_name = cat["name"]
                     # Context for rules
                     ctx = {
                         "region": region_name, 
@@ -496,7 +687,7 @@ def main():
     for defn in cfg.get("definitions", []):
         eras = defn["eras"]
         channels = defn["channels"]
-        cats_obj, cats_names = normalize_categories(defn["categories"], symmetrized)
+        cats_obj, cats_names, cats_spec = normalize_categories(defn["categories"], symmetrized)
         variable = defn["variable"]
         shape_pattern = defn["shape_file"]
         region_name = defn["name"]
@@ -515,33 +706,41 @@ def main():
                 # Always refresh copy each run (avoid stale partial patches)
                 shutil.copy2(fpath_in, patched_fpath)
 
-                # ---- Build patterns PER CATEGORY (because YAML needs {category}) ----
+                # Build generic patterns with $BIN preserved so missing shape nuisances
+                # can be patched across all categories before ExtractShapes runs.
                 nom_tmpl = defn.get("nominal")
                 syst_tmpl = defn.get("syst")
-
-                # Patch once per (era, chn) using patterns from the FIRST category.
-                # (In ROOT file paths, category is often part of the directory; if templates
-                # differ per category, you should patch per-category too — but most setups don't.)
-                first_cat_name = cats_names[0] if cats_names else None
-                ctx0 = {"era": era, "channel": chn, "var": variable, "category": first_cat_name}
+                ctx0 = {"era": era, "channel": chn, "var": variable, "category": "$BIN"}
                 nom_pat0 = nom_tmpl.format(**ctx0) if nom_tmpl else "$BIN/Nominal/$PROCESS/" + variable
                 syst_pat0 = syst_tmpl.format(**ctx0) if syst_tmpl else "$BIN/$SYSTEMATIC/$PROCESS/" + variable
 
-                # Patch ONLY the copied file
                 # patch_missing_syst_hists(
                 #     root_path=str(patched_fpath),
                 #     cb=cb,
                 #     era=era,
                 #     channel=chn,
-                #     bins=cats_names,      # $BIN values (category names)
+                #     bins=cats_names,
                 #     variable=variable,
                 #     nom_pat=nom_pat0,
                 #     syst_pat=syst_pat0,
                 #     mode="copy_nominal",
                 # )
 
+                for cat in cats_spec:
+                    if cat["rebin"] > 1:
+                        rebin_category_shapes(
+                            root_path=str(patched_fpath),
+                            category=cat["name"],
+                            hist_name=variable,
+                            factor=cat["rebin"],
+                            mode=cat["rebin_mode"],
+                            direction=cat["rebin_direction"],
+                        )
+
                 # Extract shapes PER CATEGORY with the correct formatted patterns
-                for cat_id, cat_name in cats_obj:
+                for cat in cats_spec:
+                    cat_id = cat["id"]
+                    cat_name = cat["name"]
                     ctx = {"era": era, "channel": chn, "var": variable, "category": cat_name}
                     nom_pat = nom_tmpl.format(**ctx) if nom_tmpl else "$BIN/Nominal/$PROCESS/" + variable
                     syst_pat = syst_tmpl.format(**ctx) if syst_tmpl else "$BIN/$SYSTEMATIC/$PROCESS/" + variable
