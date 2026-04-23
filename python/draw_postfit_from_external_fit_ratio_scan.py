@@ -72,24 +72,37 @@ from draw_postfit_from_external_fit import (
     DEFAULT_GROUP_ORDER,
     FIT_TO_MODE,
     MERGE_SPEC_LOCAL,
+    SL_SR_COMBINED_GROUP,
     _apply_postfit_central_values,
     _build_correlation_matrix,
     _build_group_covariance,
     _build_plot_groups,
+    _build_section_axis_ticks,
     _build_stack_colors,
     _build_summary_payload,
+    _combine_group_payloads,
     _collect_realvar_names,
     _discover_shape_processes,
     _discover_workspace_shape_processes,
+    _draw_section_spans,
     _evaluate_process_histogram,
     _extract_fit_parameters,
     _guess_shapes_node,
+    _normalize_stack_by_bin_width,
+    _normalize_values_by_bin_width,
+    _normalize_covariance_by_bin_width,
+    _plot_output_variants,
     _parse_process_regex_overrides,
     _poisson_errors,
     _rebin_covariance,
+    _ratio_band_width,
+    _resolve_combined_stack_labels,
     _resolve_fit_object_name,
+    _should_normalize_by_bin_width,
     _selected_by_regex,
     _summarize_group_components,
+    _trim_axis_ticks,
+    _trim_section_spans,
 )
 from plot_error_bands_from_combine_ws import (
     _assign_values,
@@ -274,7 +287,9 @@ def _evaluate_group_for_strength(
     if not xlabel:
         xlabel = obs.GetName()
     group_process_sums = None
+    group_process_stat_variances = None
     process_failures: List[str] = []
+    stat_source_counts: Dict[str, int] = {}
 
     for state_index, state in enumerate(group_states, start=1):
         print(
@@ -306,6 +321,9 @@ def _evaluate_group_for_strength(
             group_process_sums = {
                 proc: np.zeros(nbins, dtype=float) for proc in tracked_processes
             }
+            group_process_stat_variances = {
+                proc: np.zeros(nbins, dtype=float) for proc in tracked_processes
+            }
         else:
             if not np.allclose(group_edges, state_edges):
                 raise RuntimeError(
@@ -320,7 +338,7 @@ def _evaluate_group_for_strength(
         for process_name in tracked_processes:
             if process_name not in state_available_processes:
                 continue
-            values, failure = _evaluate_process_histogram(
+            values, stat_variance, failure, stat_source = _evaluate_process_histogram(
                 workspace,
                 pdf,
                 data,
@@ -334,11 +352,17 @@ def _evaluate_group_for_strength(
                 process_regex_overrides,
             )
             group_process_sums[process_name] += values
+            if group_process_stat_variances is not None:
+                group_process_stat_variances[process_name] += stat_variance
+            stat_source_counts[stat_source] = stat_source_counts.get(stat_source, 0) + 1
             if failure is not None:
                 process_failures.append(f"{state}/{process_name}: {failure}")
 
-        state_plot_edges, state_xlabel = _resolve_plot_axis(
-            np.asarray(state_edges, dtype=float),
+        lo, hi = _trim_leading_trailing_zeros(state_total_values, state_data_values)
+        active_state_edges = state_edges[lo : hi + 2]
+
+        active_plot_edges, state_xlabel = _resolve_plot_axis(
+            np.asarray(active_state_edges, dtype=float),
             analysis_dir,
             config_path,
             state,
@@ -347,33 +371,16 @@ def _evaluate_group_for_strength(
             xaxis_label=xaxis_label,
             fallback_xlabel=xlabel,
         )
-        if manual_x_edges is None:
-            active_bins = np.flatnonzero(
-                (np.abs(state_total_values) > 0.0) | (np.abs(state_data_values) > 0.0)
-            )
-            if active_bins.size:
-                active_lo = int(active_bins[0])
-                active_hi = int(active_bins[-1])
-                active_nbins = active_hi - active_lo + 1
-                if (
-                    active_nbins < nbins
-                    and active_bins.size == active_nbins
-                    and len(state_plot_edges) != active_nbins + 1
-                ):
-                    compact_edges, compact_xlabel = _load_original_axis(
-                        analysis_dir,
-                        config_path,
-                        state,
-                        list(state_available_processes),
-                        active_nbins,
-                    )
-                    if compact_edges is not None and len(compact_edges) == active_nbins + 1:
-                        state_plot_edges = np.asarray(compact_edges, dtype=float)
-                        if compact_xlabel:
-                            state_xlabel = DEFAULT_XAXIS_LABELS.get(
-                                compact_xlabel,
-                                compact_xlabel,
-                            )
+
+        state_plot_edges = np.arange(len(state_edges), dtype=float)
+        if len(active_plot_edges) == hi - lo + 2:
+            state_plot_edges[lo : hi + 2] = active_plot_edges
+            if lo > 0:
+                state_plot_edges[:lo] = active_plot_edges[0] - np.arange(lo, 0, -1)
+            if hi + 2 < len(state_plot_edges):
+                state_plot_edges[hi + 2:] = active_plot_edges[-1] + np.arange(1, len(state_plot_edges) - (hi + 2) + 1)
+        else:
+            state_plot_edges = np.asarray(state_edges, dtype=float)
 
         if plot_edges is None:
             plot_edges = state_plot_edges
@@ -400,7 +407,11 @@ def _evaluate_group_for_strength(
         "plot_edges": np.asarray(plot_edges if plot_edges is not None else group_edges, dtype=float),
         "xlabel": xlabel,
         "process_sums": group_process_sums if group_process_sums is not None else {},
+        "process_stat_variances": (
+            group_process_stat_variances if group_process_stat_variances is not None else {}
+        ),
         "process_failures": process_failures,
+        "stat_source_counts": stat_source_counts,
     }
 
 
@@ -432,7 +443,10 @@ def _ratio_curve_label(
     curve_strength: float,
     reference_strength: float,
     blind: bool,
+    partial_blind: bool = False,
 ) -> str:
+    if partial_blind:
+        return f"{ratio_label_prefix}(r={_format_strength(curve_strength)})"
     curve_label = f"{ratio_label_prefix}(r={_format_strength(curve_strength)})"
     if blind:
         return (
@@ -442,36 +456,76 @@ def _ratio_curve_label(
     return curve_label
 
 
+def _resolve_blind_mask(
+    blind: bool,
+    blind_mask: Optional[np.ndarray],
+    size: int,
+) -> np.ndarray:
+    if blind_mask is not None:
+        mask = np.asarray(blind_mask, dtype=bool)
+        if mask.shape != (size,):
+            raise ValueError("blind_mask shape must match histogram bin count")
+        return mask
+    if blind:
+        return np.ones(size, dtype=bool)
+    return np.zeros(size, dtype=bool)
+
+
+def _scan_ratio_numerator_denominator(
+    curve: Dict[str, object],
+    reference_curve: Dict[str, object],
+    blind: bool,
+    blind_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    total_values = np.asarray(curve["total_values"], dtype=float)
+    data_values = np.asarray(curve["data_values"], dtype=float)
+    reference_total_values = np.asarray(reference_curve["total_values"], dtype=float)
+    active_blind_mask = _resolve_blind_mask(blind, blind_mask, len(total_values))
+
+    numerator = data_values.copy()
+    denominator = total_values.copy()
+    numerator[active_blind_mask] = total_values[active_blind_mask]
+    denominator[active_blind_mask] = reference_total_values[active_blind_mask]
+    return numerator, denominator, active_blind_mask
+
+
 def _ratio_y_limits(
     scan_curves: Sequence[Dict[str, object]],
     reference_curve: Dict[str, object],
     blind: bool,
+    blind_mask: Optional[np.ndarray] = None,
 ) -> Tuple[float, float]:
     lows: List[float] = []
     highs: List[float] = []
     reference_total_values = np.asarray(reference_curve["total_values"], dtype=float)
+    active_blind_mask = _resolve_blind_mask(
+        blind,
+        blind_mask,
+        len(reference_total_values),
+    )
     for curve in scan_curves:
-        total_values = np.asarray(curve["total_values"], dtype=float)
-        if blind:
-            numerator = total_values
-            denominator = reference_total_values
-        else:
-            numerator = np.asarray(curve["data_values"], dtype=float)
-            denominator = total_values
+        numerator, denominator, _ = _scan_ratio_numerator_denominator(
+            curve,
+            reference_curve,
+            blind,
+            blind_mask=active_blind_mask,
+        )
         mask = denominator > 0.0
         if np.any(mask):
             ratio = numerator[mask] / denominator[mask]
             lows.extend(ratio.tolist())
             highs.extend(ratio.tolist())
         if curve is reference_curve:
-            total_errors = np.sqrt(
-                np.clip(np.diag(np.asarray(curve["covariance"], dtype=float)), 0.0, None)
+            band = _ratio_band_width(
+                np.asarray(curve["total_values"], dtype=float),
+                np.asarray(curve["covariance"], dtype=float),
+                data_values=np.asarray(curve["data_values"], dtype=float),
+                include_data_stat=~active_blind_mask,
             )
             band_mask = reference_total_values > 0.0
             if np.any(band_mask):
-                band = total_errors[band_mask] / reference_total_values[band_mask]
-                lows.extend((1.0 - band).tolist())
-                highs.extend((1.0 + band).tolist())
+                lows.extend((1.0 - band[band_mask]).tolist())
+                highs.extend((1.0 + band[band_mask]).tolist())
 
     if not lows or not highs:
         return 0.5, 1.5
@@ -541,6 +595,10 @@ def _plot_channel_ratio_scan(
     ratio_label_prefix: str,
     blind: bool,
     signal_stack_label: Optional[str] = None,
+    section_spans: Optional[Sequence[Tuple[str, int, int]]] = None,
+    blind_mask: Optional[np.ndarray] = None,
+    x_tick_positions: Optional[np.ndarray] = None,
+    x_tick_labels: Optional[Sequence[str]] = None,
 ) -> None:
     if not scan_curves:
         return
@@ -570,6 +628,13 @@ def _plot_channel_ratio_scan(
             break
     if reference_curve is None:
         reference_curve = trimmed_curves[0]
+    trimmed_section_spans = _trim_section_spans(section_spans, trim_slice)
+    active_blind_mask = _resolve_blind_mask(
+        blind,
+        None if blind_mask is None else np.asarray(blind_mask, dtype=bool)[trim_slice],
+        len(data_values),
+    )
+    partial_blind = bool(np.any(active_blind_mask) and not np.all(active_blind_mask))
 
     edges = calc_edges
     display_edges = reference_curve.get("display_edges")
@@ -583,6 +648,11 @@ def _plot_channel_ratio_scan(
             candidate_edges = display_edges[start : stop + 1]
             if candidate_edges.size == data_values.size + 1:
                 edges = candidate_edges
+    trimmed_tick_positions, trimmed_tick_labels = _trim_axis_ticks(
+        x_tick_positions,
+        x_tick_labels,
+        edges,
+    )
 
     stack_values = np.asarray(reference_curve["stack_array"], dtype=float)
     display_stack_labels = list(stack_display_labels)
@@ -600,8 +670,33 @@ def _plot_channel_ratio_scan(
             mpl.colors.to_rgba(SIG_STYLE.get("color", "#FF0000"), 0.55)
         )
     centers = 0.5 * (edges[:-1] + edges[1:])
-    data_mask = data_values > 0.0
+    data_mask = (data_values > 0.0) & ~active_blind_mask
     eyl, eyh = _poisson_errors(data_values)
+    normalize_by_width = _should_normalize_by_bin_width(edges)
+    plot_stack_values = stack_values
+    plot_ref_total_values = ref_total_values = np.asarray(reference_curve["total_values"], dtype=float)
+    plot_ref_total_errors = np.sqrt(
+        np.clip(np.diag(np.asarray(reference_curve["covariance"], dtype=float)), 0.0, None)
+    )
+    plot_data_values = data_values
+    plot_eyl = eyl
+    plot_eyh = eyh
+    if normalize_by_width:
+        plot_stack_values = _normalize_stack_by_bin_width(stack_values, edges)
+        plot_ref_total_values = _normalize_values_by_bin_width(ref_total_values, edges)
+        plot_ref_total_errors = np.sqrt(
+            np.clip(
+                np.diag(_normalize_covariance_by_bin_width(
+                    np.asarray(reference_curve["covariance"], dtype=float),
+                    edges,
+                )),
+                0.0,
+                None,
+            )
+        )
+        plot_data_values = _normalize_values_by_bin_width(data_values, edges)
+        plot_eyl = _normalize_values_by_bin_width(eyl, edges)
+        plot_eyh = _normalize_values_by_bin_width(eyh, edges)
 
     fig = plt.figure(figsize=(12.0, 12.0))
     gs = plt.GridSpec(2, 1, height_ratios=[3.2, 1.2], hspace=0.05)
@@ -612,7 +707,7 @@ def _plot_channel_ratio_scan(
 
     if stack_values.size:
         hep.histplot(
-            stack_values,
+            plot_stack_values,
             bins=edges,
             stack=True,
             histtype="fill",
@@ -624,15 +719,11 @@ def _plot_channel_ratio_scan(
             zorder=1,
         )
 
-    ref_total_values = np.asarray(reference_curve["total_values"], dtype=float)
-    ref_total_errors = np.sqrt(
-        np.clip(np.diag(np.asarray(reference_curve["covariance"], dtype=float)), 0.0, None)
-    )
     _step_band(
         ax,
         edges,
-        ref_total_values,
-        ref_total_errors,
+        plot_ref_total_values,
+        plot_ref_total_errors,
         label=reference_band_label,
         alpha=0.15,
         color="#9aa0a6",
@@ -642,11 +733,11 @@ def _plot_channel_ratio_scan(
         linewidth=0.8,
     )
 
-    if not blind:
+    if np.any(data_mask):
         eb_main = ax.errorbar(
             centers[data_mask],
-            data_values[data_mask],
-            yerr=[eyl[data_mask], eyh[data_mask]],
+            plot_data_values[data_mask],
+            yerr=[plot_eyl[data_mask], plot_eyh[data_mask]],
             zorder=6,
             **DATA_STYLE,
             label=data_label,
@@ -664,30 +755,31 @@ def _plot_channel_ratio_scan(
 
     for idx, curve in enumerate(trimmed_curves):
         total_values = np.asarray(curve["total_values"], dtype=float)
-        if blind:
-            denominator = ref_total_values
-            numerator = total_values
-        else:
-            denominator = total_values
-            numerator = data_values
+        numerator, denominator, _ = _scan_ratio_numerator_denominator(
+            curve,
+            reference_curve,
+            blind,
+            blind_mask=active_blind_mask,
+        )
         denom_mask = denominator > 0.0
 
         ratio = np.full_like(total_values, np.nan, dtype=float)
         ratio[denom_mask] = numerator[denom_mask] / denominator[denom_mask]
 
         if abs(float(curve["strength"]) - reference_strength) <= 1e-12:
-            total_errors = np.sqrt(
-                np.clip(np.diag(np.asarray(curve["covariance"], dtype=float)), 0.0, None)
+            ratio_band = _ratio_band_width(
+                total_values,
+                np.asarray(curve["covariance"], dtype=float),
+                data_values=data_values,
+                include_data_stat=~active_blind_mask,
             )
-            ratio_band = np.zeros_like(total_values, dtype=float)
-            ratio_band[denom_mask] = total_errors[denom_mask] / total_values[denom_mask]
             _step_band(
                 rax,
                 edges,
                 np.ones_like(total_values),
                 ratio_band,
                 alpha=0.18,
-                color=curve["color"],
+                color=BAND_COLOR,
                 zorder=1.0 + 0.1 * idx,
             )
 
@@ -700,6 +792,7 @@ def _plot_channel_ratio_scan(
                 float(curve["strength"]),
                 reference_strength,
                 blind,
+                partial_blind=partial_blind,
             ),
             linestyle=curve["linestyle"],
             linewidth=2.2 if abs(float(curve["strength"]) - reference_strength) <= 1e-12 else 1.8,
@@ -707,6 +800,7 @@ def _plot_channel_ratio_scan(
         )
 
     rax.axhline(1.0, color="k", lw=1.4, ls="--", alpha=0.9, zorder=3)
+    _draw_section_spans(ax, rax, edges, trimmed_section_spans)
 
     handles_main, labels_main = ax.get_legend_handles_labels()
     main_handles: List[object] = []
@@ -756,14 +850,27 @@ def _plot_channel_ratio_scan(
     else:
         ax.set_ylim(0, None)
 
-    rmin, rmax = _ratio_y_limits(trimmed_curves, reference_curve, blind)
-    ax.set_ylabel("Events", fontsize=AXIS_LABEL_FONTSIZE)
+    rmin, rmax = _ratio_y_limits(
+        trimmed_curves,
+        reference_curve,
+        blind,
+        blind_mask=active_blind_mask,
+    )
+    ax.set_ylabel(
+        "Events / bin width" if normalize_by_width else "Events",
+        fontsize=AXIS_LABEL_FONTSIZE,
+    )
     rax.set_ylabel(
-        f"{ratio_label_prefix}/{ratio_label_prefix}" if blind else ratio_label_prefix,
+        "Ratio" if partial_blind else (
+            f"{ratio_label_prefix}/{ratio_label_prefix}" if blind else ratio_label_prefix
+        ),
         fontsize=AXIS_LABEL_FONTSIZE,
     )
     rax.set_xlabel(xlabel, fontsize=AXIS_LABEL_FONTSIZE)
     rax.set_ylim(rmin, rmax)
+    if trimmed_tick_positions is not None and trimmed_tick_labels is not None:
+        rax.set_xticks(trimmed_tick_positions)
+        rax.set_xticklabels(trimmed_tick_labels)
     ax.tick_params(axis="both", which="both", labelsize=TICK_LABEL_FONTSIZE)
     rax.tick_params(axis="both", which="both", labelsize=TICK_LABEL_FONTSIZE)
     plt.setp(ax.get_xticklabels(), visible=False)
@@ -860,7 +967,7 @@ def main() -> None:
     parser.add_argument(
         "--nuisance-exclude-regex",
         default=DEFAULT_AUTOMCSTAT_REGEX,
-        help="Regex for nuisances to exclude from the propagated band",
+        help="Regex for nuisances to exclude from the correlated propagated band",
     )
     parser.add_argument(
         "--strict-nuisance-check",
@@ -906,7 +1013,11 @@ def main() -> None:
         help="Signal strength used for the main stack/band reference. Default: 1 if scanned, otherwise the first scan point.",
     )
     parser.add_argument("--cms-text", default="Preliminary", help="CMS label text")
-    parser.add_argument("--logy", action="store_true", help="Use log scale on the main pad")
+    parser.add_argument(
+        "--logy",
+        action="store_true",
+        help="Also save a log-scale companion plot in addition to the default linear plot",
+    )
     parser.add_argument(
         "--bkg-keys",
         default=",".join(DEFAULT_BKG_KEYS),
@@ -1081,6 +1192,7 @@ def main() -> None:
     summary_payload = _build_summary_payload(
         fit_result_path,
         workspace_path,
+        mode,
         fit_object_name,
         selected_names,
         fit_only_names,
@@ -1100,6 +1212,7 @@ def main() -> None:
 
     component_summary_path = outdir_mode / "component_summary.json"
     component_summary: Dict[str, object] = {}
+    group_scan_payloads: Dict[str, Dict[str, object]] = {}
     workspace_shape_map = _discover_workspace_shape_processes(workspace, states)
     workspace_process_map = {
         state: tuple(sorted(values.keys())) for state, values in workspace_shape_map.items()
@@ -1246,6 +1359,19 @@ def main() -> None:
                     fit_errors,
                     correlation,
                 )
+                mcstat_variance = np.zeros(len(nominal["group_edges"]) - 1, dtype=float)
+                for values in nominal.get("process_stat_variances", {}).values():
+                    mcstat_variance += np.asarray(values, dtype=float)
+                group_covariance = group_covariance + np.diag(np.clip(mcstat_variance, 0.0, None))
+                stat_source_counts = nominal.get("stat_source_counts", {})
+                if idx == 0 and stat_source_counts:
+                    counts_text = ", ".join(
+                        f"{key}={stat_source_counts[key]}" for key in sorted(stat_source_counts)
+                    )
+                    print(
+                        f"[info] {group_name}: decorrelated autoMCStats term added "
+                        f"({counts_text})"
+                    )
 
                 stack_array = _build_stack_array(
                     source_lists,
@@ -1400,24 +1526,173 @@ def main() -> None:
                     "ratio_prefix",
                 )
             outfile = outdir_mode / f"{mode}_{group_name}_ratio_scan.png"
-            _plot_channel_ratio_scan(
-                channel=group_name,
-                mode=mode,
-                xlabel=str(reference_curve["xlabel"]),
-                scan_curves=scan_curves,
-                stack_labels=stack_labels,
-                stack_display_labels=display_stack_labels,
-                cms_text=args.cms_text,
-                lumi_text=LUMI_MAP["Run2"],
-                logy=args.logy,
-                outfile=outfile,
-                reference_strength=reference_strength,
-                reference_band_label=reference_band_label,
-                data_label=data_label,
-                ratio_label_prefix=ratio_label_prefix,
-                blind=args.blind,
-                signal_stack_label=signal_stack_label,
+            for plot_outfile, plot_logy in _plot_output_variants(outfile, args.logy):
+                _plot_channel_ratio_scan(
+                    channel=group_name,
+                    mode=mode,
+                    xlabel=str(reference_curve["xlabel"]),
+                    scan_curves=scan_curves,
+                    stack_labels=stack_labels,
+                    stack_display_labels=display_stack_labels,
+                    cms_text=args.cms_text,
+                    lumi_text=LUMI_MAP["Run2"],
+                    logy=plot_logy,
+                    outfile=plot_outfile,
+                    reference_strength=reference_strength,
+                    reference_band_label=reference_band_label,
+                    data_label=data_label,
+                    ratio_label_prefix=ratio_label_prefix,
+                    blind=args.blind,
+                    signal_stack_label=signal_stack_label,
+                )
+            group_scan_payloads[group_name] = {
+                "stack_labels": tuple(stack_labels),
+                "scan_curves": scan_curves,
+                "reference_strength": reference_strength,
+                "reference_band_label": reference_band_label,
+                "data_label": data_label,
+                "ratio_label_prefix": ratio_label_prefix,
+                "signal_stack_label": signal_stack_label,
+            }
+
+        if "SL" in group_scan_payloads and "SR" in group_scan_payloads:
+            left_payload = group_scan_payloads["SL"]
+            right_payload = group_scan_payloads["SR"]
+            combined_stack_labels = _resolve_combined_stack_labels(
+                bkg_keys,
+                left_payload["stack_labels"],
+                right_payload["stack_labels"],
             )
+            left_curves_by_strength = {
+                float(curve["strength"]): curve for curve in left_payload["scan_curves"]
+            }
+            right_curves_by_strength = {
+                float(curve["strength"]): curve for curve in right_payload["scan_curves"]
+            }
+
+            combined_scan_curves: List[Dict[str, object]] = []
+            for strength in scan_strengths:
+                left_curve = dict(left_curves_by_strength[float(strength)])
+                right_curve = dict(right_curves_by_strength[float(strength)])
+                left_curve["stack_labels"] = left_payload["stack_labels"]
+                right_curve["stack_labels"] = right_payload["stack_labels"]
+                combined_curve = _combine_group_payloads(
+                    left_curve,
+                    right_curve,
+                    combined_stack_labels,
+                )
+                combined_curve.update(
+                    {
+                        "strength": float(strength),
+                        "label": left_curve["label"],
+                        "color": left_curve["color"],
+                        "linestyle": left_curve["linestyle"],
+                    }
+                )
+                combined_scan_curves.append(combined_curve)
+
+            combined_reference_curve = None
+            for curve in combined_scan_curves:
+                if abs(float(curve["strength"]) - reference_strength) <= 1e-12:
+                    combined_reference_curve = curve
+                    break
+            if combined_reference_curve is None:
+                combined_reference_curve = combined_scan_curves[0]
+
+            component_summary[SL_SR_COMBINED_GROUP] = _summarize_scan_components(
+                SL_SR_COMBINED_GROUP,
+                combined_stack_labels,
+                combined_reference_curve,
+                combined_scan_curves,
+                args.signal_key,
+                reference_strength,
+            )
+            with component_summary_path.open("w", encoding="utf-8") as handle:
+                json.dump(component_summary, handle, indent=2, ensure_ascii=False)
+
+            left_reference_curve = None
+            right_reference_curve = None
+            for curve in left_payload["scan_curves"]:
+                if abs(float(curve["strength"]) - reference_strength) <= 1e-12:
+                    left_reference_curve = curve
+                    break
+            for curve in right_payload["scan_curves"]:
+                if abs(float(curve["strength"]) - reference_strength) <= 1e-12:
+                    right_reference_curve = curve
+                    break
+            if left_reference_curve is None:
+                left_reference_curve = left_payload["scan_curves"][0]
+            if right_reference_curve is None:
+                right_reference_curve = right_payload["scan_curves"][0]
+
+            sl_nbins = len(np.asarray(left_reference_curve["total_values"], dtype=float))
+            sr_nbins = len(np.asarray(right_reference_curve["total_values"], dtype=float))
+            combined_section_spans = (
+                ("SL CR", 0, sl_nbins),
+                ("SR", sl_nbins, sl_nbins + sr_nbins),
+            )
+            combined_blind_mask = np.zeros(sl_nbins + sr_nbins, dtype=bool)
+            if args.blind:
+                combined_blind_mask[sl_nbins:] = True
+                print(
+                    f"[info] {SL_SR_COMBINED_GROUP}: blind mode keeps SL CR visible and "
+                    f"hides observed points only in SR"
+                )
+            combined_tick_positions, combined_tick_labels = _build_section_axis_ticks(
+                np.asarray(
+                    combined_reference_curve.get("display_edges", combined_reference_curve["edges"]),
+                    dtype=float,
+                ),
+                combined_section_spans,
+                (
+                    np.asarray(
+                        left_reference_curve.get("display_edges", left_reference_curve["edges"]),
+                        dtype=float,
+                    ),
+                    np.asarray(
+                        right_reference_curve.get("display_edges", right_reference_curve["edges"]),
+                        dtype=float,
+                    ),
+                ),
+            )
+            display_stack_labels = tuple(
+                _display_label(legend_label_map, label, label)
+                for label in combined_stack_labels
+            )
+            combined_data_label = str(left_payload["data_label"])
+            combined_ratio_label_prefix = str(left_payload["ratio_label_prefix"])
+            if args.blind:
+                combined_data_label = _display_label(legend_label_map, "Data", "data")
+                combined_ratio_label_prefix = "Ratio"
+                if legend_label_map:
+                    for key in ("ratio_partial", "ratio_combined", "ratio", "ratio_prefix"):
+                        if key in legend_label_map:
+                            combined_ratio_label_prefix = legend_label_map[key]
+                            break
+            outfile = outdir_mode / f"{mode}_{SL_SR_COMBINED_GROUP}_ratio_scan.png"
+            for plot_outfile, plot_logy in _plot_output_variants(outfile, args.logy):
+                _plot_channel_ratio_scan(
+                    channel=SL_SR_COMBINED_GROUP,
+                    mode=mode,
+                    xlabel=str(combined_reference_curve["xlabel"]),
+                    scan_curves=combined_scan_curves,
+                    stack_labels=combined_stack_labels,
+                    stack_display_labels=display_stack_labels,
+                    cms_text=args.cms_text,
+                    lumi_text=LUMI_MAP["Run2"],
+                    logy=plot_logy,
+                    outfile=plot_outfile,
+                    reference_strength=reference_strength,
+                    reference_band_label=str(left_payload["reference_band_label"]),
+                    data_label=combined_data_label,
+                    ratio_label_prefix=combined_ratio_label_prefix,
+                    blind=args.blind,
+                    signal_stack_label=left_payload["signal_stack_label"],
+                    section_spans=combined_section_spans,
+                    blind_mask=combined_blind_mask,
+                    x_tick_positions=combined_tick_positions,
+                    x_tick_labels=combined_tick_labels,
+                )
 
         print(f"[info] component summary    : {component_summary_path}")
     finally:

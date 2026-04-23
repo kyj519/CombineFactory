@@ -172,6 +172,7 @@ DEFAULT_XAXIS_LABELS: dict[str, str] = {
     "Template_MVA_Score": r"$\mathcal{D}_{W\to cb}$",
     "BvsC_3rd_4th_Jets_Unrolled": r"Unrolled $B$vs$C$ score (3rd/4th jets)",
 }
+_AXIS_RECOVERY_NOTIFIED: set[str] = set()
 
 DEFAULT_LEGEND_LABELS: dict[str, str] = {
     "BB_TTLJ": r"$t\bar{t}+b$ (semilepton)",
@@ -638,13 +639,27 @@ def shapes_node_for_mode(mode: str) -> str:
 
 def _parse_channel_name(channel: str):
     match = re.match(
-        r"^(Control(?:_DL)?|Signal(?:_DL)?)_(2016preVFP|2016postVFP|2017|2018)_([A-Za-z0-9]+)$",
+        r"^([A-Za-z_]+)_(2016preVFP|2016postVFP|2017|2018)_([A-Za-z0-9]+)$",
         channel,
     )
     if not match:
         return None
-    category, era, lepton_channel = match.groups()
-    region = "dl" if category.endswith("_DL") else "sl"
+    raw_category, era, lepton_channel = match.groups()
+    alias_map = {
+        "Control": ("Control", "sl"),
+        "SL": ("Control", "sl"),
+        "SL_CR": ("Control", "sl"),
+        "CR": ("Control", "sl"),
+        "Signal": ("Signal", "sl"),
+        "SR": ("Signal", "sl"),
+        "Control_DL": ("Control_DL", "dl"),
+        "DL": ("Control_DL", "dl"),
+        "Signal_DL": ("Signal_DL", "dl"),
+    }
+    resolved = alias_map.get(raw_category)
+    if resolved is None:
+        return None
+    category, region = resolved
     return {
         "category": category,
         "era": era,
@@ -853,28 +868,54 @@ def _load_original_axis(
         return None, variable
 
     category = channel_info["category"]
+
+    def _extract_axis_from_hist(hist):
+        _, edges = hist.to_numpy()
+        edges = np.asarray(edges, dtype=float)
+        axis = hist.member("fXaxis")
+        axis_title = (axis.member("fTitle") or "").strip()
+        if len(edges) == nbins_expected + 1:
+            return edges, (axis_title or variable)
+
+        rebinned_edges = _rebinned_original_edges_from_config(
+            config_path,
+            channel,
+            edges,
+            nbins_expected,
+        )
+        if rebinned_edges is not None:
+            return rebinned_edges, (axis_title or variable)
+        return None, None
+
     with uproot.open(root_path) as src:
         for process in source_candidates:
             hist_key = f"{category}/Nominal/{process}/{variable}"
             if hist_key not in src:
                 continue
             hist = src[hist_key]
-            _, edges = hist.to_numpy()
-            edges = np.asarray(edges, dtype=float)
-            axis = hist.member("fXaxis")
-            axis_title = (axis.member("fTitle") or "").strip()
-            if len(edges) == nbins_expected + 1:
-                return edges, (axis_title or variable)
+            resolved_edges, resolved_xlabel = _extract_axis_from_hist(hist)
+            if resolved_edges is not None:
+                return resolved_edges, resolved_xlabel
 
-            rebinned_edges = _rebinned_original_edges_from_config(
-                config_path,
-                channel,
-                edges,
-                nbins_expected,
-            )
-            if rebinned_edges is not None:
-                return rebinned_edges, (axis_title or variable)
+        prefix = f"{category}/Nominal/"
+        suffix = f"/{variable}"
+        for key in src.keys(recursive=True, cycle=False):
+            clean_key = str(key).split(";")[0]
+            if not clean_key.startswith(prefix):
+                continue
+            if not clean_key.endswith(suffix):
+                continue
+            hist = src[clean_key]
+            resolved_edges, resolved_xlabel = _extract_axis_from_hist(hist)
+            if resolved_edges is not None:
+                return resolved_edges, resolved_xlabel
 
+    if channel not in _AXIS_RECOVERY_NOTIFIED:
+        _AXIS_RECOVERY_NOTIFIED.add(channel)
+        print(
+            f"[warn] {channel}: failed to recover original x-axis from {root_path}; "
+            "falling back to workspace bin indices."
+        )
     return None, variable
 
 
@@ -1091,8 +1132,29 @@ def plot_one_channel(
     )
     workspace_edges = np.asarray(edges, dtype=float)
     manual_x_edges = _parse_x_edges(x_edges_spec)
-    edges, xlabel = _resolve_plot_axis(
-        workspace_edges,
+
+    hb_tmp = f[f"{dpath}/total_background"]
+    bkg_tot_tmp, _, _ = _hist_to_numpy_and_err(hb_tmp)
+
+    data_key_tmp = _first_existing(f, dpath, ("data", "data_obs", "data;1", "data_obs;1"))
+    g_tmp = f[f"{dpath}/{data_key_tmp}"]
+    n_tmp = int(g_tmp.member("fNpoints"))
+    y_tmp = np.asarray(g_tmp.member("fY"))[:n_tmp]
+
+    sig_tot_tmp = None
+    if mode == "postfit_s":
+        try:
+            hs_tmp = f[f"{dpath}/total_signal"]
+            sig_tot_tmp, _, _ = _hist_to_numpy_and_err(hs_tmp)
+        except Exception:
+            pass
+
+    denom_tmp = bkg_tot_tmp + sig_tot_tmp if sig_tot_tmp is not None else bkg_tot_tmp
+    lo_tmp, hi_tmp = _trim_leading_trailing_zeros(denom_tmp, y_tmp)
+    active_workspace_edges = workspace_edges[lo_tmp : hi_tmp + 2]
+
+    active_plot_edges, xlabel = _resolve_plot_axis(
+        active_workspace_edges,
         analysis_dir,
         config_path,
         channel,
@@ -1100,6 +1162,17 @@ def plot_one_channel(
         manual_edges=manual_x_edges,
         xaxis_label=xaxis_label,
     )
+
+    edges = np.arange(len(workspace_edges), dtype=float)
+    if len(active_plot_edges) == hi_tmp - lo_tmp + 2:
+        edges[lo_tmp : hi_tmp + 2] = active_plot_edges
+        if lo_tmp > 0:
+            edges[:lo_tmp] = active_plot_edges[0] - np.arange(lo_tmp, 0, -1)
+        if hi_tmp + 2 < len(edges):
+            edges[hi_tmp + 2:] = active_plot_edges[-1] + np.arange(1, len(edges) - (hi_tmp + 2) + 1)
+    else:
+        edges = np.asarray(workspace_edges, dtype=float)
+
     display_edges_override = not np.allclose(edges, workspace_edges)
 
     # ---- totals for band + ratio ----

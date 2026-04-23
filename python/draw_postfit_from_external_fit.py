@@ -23,8 +23,10 @@ Workflow
 
    around the chosen central point.
 
-autoMCStats-like nuisances are ignored by default because the binning differs
-between the source fit and the target workspace.
+autoMCStats-like nuisances are kept out of the correlated propagation by default.
+Instead, a decorrelated per-bin MC-stat diagonal term is added on top of the
+propagated covariance using exact template variances when recoverable from the
+workspace and a Poisson proxy otherwise.
 """
 from __future__ import annotations
 
@@ -121,6 +123,7 @@ MODE_TO_FIT_OBJECT = {mode: name for name, mode in FIT_TO_MODE.items()}
 MERGE_SPEC_LOCAL = dict(MERGE_SPEC)
 MERGE_SPEC_LOCAL.setdefault("Others", "*")
 DEFAULT_GROUP_ORDER = ("SR", "SL", "DL")
+SL_SR_COMBINED_GROUP = "SL_CR_plus_SR"
 
 
 def _resolve_fit_object_name(pull_source: str) -> str:
@@ -469,6 +472,14 @@ def _lookup_workspace_shape_object(
     return None, None
 
 
+def _lookup_workspace_shape_entry(
+    state: str,
+    process_name: str,
+    workspace_shape_map: Dict[str, Dict[str, Dict[str, str]]],
+) -> Dict[str, str]:
+    return workspace_shape_map.get(state, {}).get(process_name, {})
+
+
 def _lookup_workspace_norm_object(workspace, state: str, process_name: str):
     for name in (
         f"n_exp_final_bin{state}_proc_{process_name}",
@@ -478,6 +489,172 @@ def _lookup_workspace_norm_object(workspace, state: str, process_name: str):
         if obj is not None and hasattr(obj, "getVal"):
             return obj, name
     return None, None
+
+
+def _extract_roodatahist_arrays(obj) -> Tuple[np.ndarray, np.ndarray]:
+    values = np.empty(int(obj.numEntries()), dtype=float)
+    variances = np.empty(int(obj.numEntries()), dtype=float)
+    for index in range(int(obj.numEntries())):
+        obj.get(index)
+        values[index] = float(obj.weight())
+        try:
+            variances[index] = float(obj.weightSquared())
+        except Exception:
+            variances[index] = abs(values[index])
+    return values, variances
+
+
+def _fasttemplate_to_array(container) -> np.ndarray:
+    size = int(container.size())
+    out = np.empty(size, dtype=float)
+    getter = getattr(container, "GetBinContent", None)
+    for index in range(size):
+        if callable(getter):
+            out[index] = float(getter(index))
+            continue
+        out[index] = float(container[index])
+    return out
+
+
+def _extract_workspace_template_arrays(shape_obj) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+    if shape_obj is None:
+        return None, None, None
+
+    try:
+        if shape_obj.InheritsFrom("RooDataHist"):
+            values, variances = _extract_roodatahist_arrays(shape_obj)
+            return values, variances, str(shape_obj.GetName())
+    except Exception:
+        pass
+
+    try:
+        if shape_obj.InheritsFrom("RooHistPdf"):
+            data_hist = shape_obj.dataHist()
+            if data_hist is not None:
+                values, variances = _extract_roodatahist_arrays(data_hist)
+                return values, variances, str(shape_obj.GetName())
+    except Exception:
+        pass
+
+    try:
+        if shape_obj.InheritsFrom("CMSHistFunc"):
+            values = _fasttemplate_to_array(shape_obj.cache())
+            errors = _fasttemplate_to_array(shape_obj.errors())
+            return values, np.square(errors), str(shape_obj.GetName())
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def _rescale_template_variances_to_nominal(
+    template_values: np.ndarray,
+    template_variances: np.ndarray,
+    nominal_values: np.ndarray,
+) -> Optional[np.ndarray]:
+    template_values = np.asarray(template_values, dtype=float)
+    template_variances = np.asarray(template_variances, dtype=float)
+    nominal_values = np.asarray(nominal_values, dtype=float)
+    if (
+        template_values.shape != nominal_values.shape
+        or template_variances.shape != nominal_values.shape
+        or nominal_values.ndim != 1
+    ):
+        return None
+
+    finite_mask = (
+        np.isfinite(template_values)
+        & np.isfinite(template_variances)
+        & np.isfinite(nominal_values)
+    )
+    if not np.any(finite_mask):
+        return None
+
+    candidates: List[float] = []
+    ratio_mask = finite_mask & (np.abs(template_values) > 1e-12)
+    if np.any(ratio_mask):
+        ratios = nominal_values[ratio_mask] / template_values[ratio_mask]
+        ratios = ratios[np.isfinite(ratios)]
+        if ratios.size:
+            candidates.append(float(np.median(ratios)))
+
+    template_sum = float(np.sum(template_values[finite_mask], dtype=float))
+    nominal_sum = float(np.sum(nominal_values[finite_mask], dtype=float))
+    if abs(template_sum) > 1e-12:
+        candidates.append(nominal_sum / template_sum)
+
+    for scale in candidates:
+        if not np.isfinite(scale):
+            continue
+        scaled_values = template_values * scale
+        tolerance = 1e-6 + 5e-2 * np.maximum(np.abs(nominal_values), 1.0)
+        if np.allclose(scaled_values, nominal_values, rtol=5e-2, atol=tolerance):
+            return np.clip(template_variances, 0.0, None) * (scale * scale)
+
+    return None
+
+
+def _estimate_process_stat_variance(
+    workspace,
+    state: str,
+    process_name: str,
+    nominal_values: np.ndarray,
+    workspace_shape_map: Dict[str, Dict[str, Dict[str, str]]],
+) -> Tuple[np.ndarray, str]:
+    nominal = np.asarray(nominal_values, dtype=float)
+    entry = _lookup_workspace_shape_entry(state, process_name, workspace_shape_map)
+    candidate_names = [entry.get("shape_name"), entry.get("wrapper_name")]
+    seen_names = set()
+
+    for name in candidate_names:
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        shape_obj = workspace.function(name) or workspace.obj(name)
+        template_values, template_variances, source_name = _extract_workspace_template_arrays(
+            shape_obj
+        )
+        if template_values is None or template_variances is None:
+            continue
+        scaled_variances = _rescale_template_variances_to_nominal(
+            template_values,
+            template_variances,
+            nominal,
+        )
+        if scaled_variances is not None:
+            source = source_name or name
+            return np.asarray(scaled_variances, dtype=float), f"exact:{source}"
+
+    return np.clip(nominal, 0.0, None), "proxy:poisson"
+
+
+def _ratio_band_width(
+    total_values: np.ndarray,
+    total_covariance: np.ndarray,
+    data_values: Optional[np.ndarray] = None,
+    include_data_stat: bool | np.ndarray = False,
+) -> np.ndarray:
+    total = np.asarray(total_values, dtype=float)
+    covariance = np.asarray(total_covariance, dtype=float)
+    band_variance = (
+        np.clip(np.diag(covariance), 0.0, None)
+        if covariance.ndim == 2 and covariance.size
+        else np.zeros_like(total, dtype=float)
+    )
+    if data_values is not None:
+        data_variance = np.clip(np.asarray(data_values, dtype=float), 0.0, None)
+        if isinstance(include_data_stat, np.ndarray):
+            data_mask = np.asarray(include_data_stat, dtype=bool)
+        else:
+            data_mask = np.full(total.shape, bool(include_data_stat), dtype=bool)
+        if data_mask.shape != total.shape:
+            raise ValueError("include_data_stat mask shape must match total_values shape")
+        band_variance = band_variance + np.where(data_mask, data_variance, 0.0)
+
+    band = np.zeros_like(total, dtype=float)
+    mask = total > 0.0
+    band[mask] = np.sqrt(band_variance[mask]) / total[mask]
+    return band
 
 
 def _evaluate_named_process_histogram(
@@ -543,6 +720,325 @@ def _build_stack_colors(labels: Sequence[str]) -> List[Tuple[float, float, float
     return colors
 
 
+def _resolve_combined_stack_labels(
+    preferred_order: Sequence[str],
+    *label_sets: Sequence[str],
+) -> Tuple[str, ...]:
+    present = {label for labels in label_sets for label in labels}
+    ordered = [label for label in preferred_order if label in present]
+    extras: List[str] = []
+    for labels in label_sets:
+        for label in labels:
+            if label in present and label not in ordered and label not in extras:
+                extras.append(label)
+    return tuple(ordered + extras)
+
+
+def _align_stack_array(
+    stack_labels: Sequence[str],
+    stack_array: np.ndarray,
+    target_labels: Sequence[str],
+    nbins: int,
+) -> np.ndarray:
+    target = np.zeros((len(target_labels), nbins), dtype=float)
+    source = np.asarray(stack_array, dtype=float)
+    label_to_index = {label: idx for idx, label in enumerate(stack_labels)}
+    for out_idx, label in enumerate(target_labels):
+        in_idx = label_to_index.get(label)
+        if in_idx is None or source.size == 0:
+            continue
+        target[out_idx] = source[in_idx]
+    return target
+
+
+def _block_diagonal_covariance(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    out = np.zeros(
+        (left.shape[0] + right.shape[0], left.shape[1] + right.shape[1]),
+        dtype=float,
+    )
+    out[: left.shape[0], : left.shape[1]] = left
+    out[left.shape[0] :, left.shape[1] :] = right
+    return out
+
+
+def _combine_axis_labels(left_label: object, right_label: object) -> str:
+    left = str(left_label).strip() if left_label is not None else ""
+    right = str(right_label).strip() if right_label is not None else ""
+    if left and right:
+        return left if left == right else f"{left} / {right}"
+    return left or right
+
+
+def _stitch_plot_edges(
+    left_edges: np.ndarray,
+    right_edges: np.ndarray,
+    left_nbins: int,
+    right_nbins: int,
+) -> np.ndarray:
+    left = np.asarray(left_edges, dtype=float)
+    right = np.asarray(right_edges, dtype=float)
+    if (
+        left.size == left_nbins + 1
+        and right.size == right_nbins + 1
+        and left.size >= 2
+        and right.size >= 2
+        and np.all(np.isfinite(left))
+        and np.all(np.isfinite(right))
+        and np.all(np.diff(left) > 0.0)
+        and np.all(np.diff(right) > 0.0)
+    ):
+        stitched = np.concatenate([left, left[-1] + np.cumsum(np.diff(right))])
+        if stitched.size == left_nbins + right_nbins + 1:
+            return stitched
+    return np.arange(left_nbins + right_nbins + 1, dtype=float)
+
+
+def _combine_optional_vector(
+    left_values: Optional[np.ndarray],
+    right_values: Optional[np.ndarray],
+    left_nbins: int,
+    right_nbins: int,
+) -> Optional[np.ndarray]:
+    if left_values is None and right_values is None:
+        return None
+    left = (
+        np.asarray(left_values, dtype=float)
+        if left_values is not None
+        else np.zeros(left_nbins, dtype=float)
+    )
+    right = (
+        np.asarray(right_values, dtype=float)
+        if right_values is not None
+        else np.zeros(right_nbins, dtype=float)
+    )
+    return np.concatenate([left, right])
+
+
+def _combine_group_payloads(
+    left_payload: Dict[str, object],
+    right_payload: Dict[str, object],
+    target_stack_labels: Sequence[str],
+) -> Dict[str, object]:
+    left_total = np.asarray(left_payload["total_values"], dtype=float)
+    right_total = np.asarray(right_payload["total_values"], dtype=float)
+    left_data = np.asarray(left_payload["data_values"], dtype=float)
+    right_data = np.asarray(right_payload["data_values"], dtype=float)
+
+    left_edges = np.asarray(
+        left_payload.get("display_edges", left_payload["edges"]),
+        dtype=float,
+    )
+    right_edges = np.asarray(
+        right_payload.get("display_edges", right_payload["edges"]),
+        dtype=float,
+    )
+    edges = _stitch_plot_edges(
+        left_edges,
+        right_edges,
+        left_total.size,
+        right_total.size,
+    )
+
+    left_stack = _align_stack_array(
+        left_payload.get("stack_labels", ()),
+        np.asarray(left_payload["stack_array"], dtype=float),
+        target_stack_labels,
+        left_total.size,
+    )
+    right_stack = _align_stack_array(
+        right_payload.get("stack_labels", ()),
+        np.asarray(right_payload["stack_array"], dtype=float),
+        target_stack_labels,
+        right_total.size,
+    )
+
+    combined = {
+        "xlabel": _combine_axis_labels(
+            left_payload.get("xlabel"),
+            right_payload.get("xlabel"),
+        ),
+        "edges": edges,
+        "display_edges": edges.copy(),
+        "stack_labels": tuple(target_stack_labels),
+        "stack_array": np.concatenate([left_stack, right_stack], axis=1),
+        "total_values": np.concatenate([left_total, right_total]),
+        "data_values": np.concatenate([left_data, right_data]),
+        "covariance": _block_diagonal_covariance(
+            np.asarray(left_payload["covariance"], dtype=float),
+            np.asarray(right_payload["covariance"], dtype=float),
+        ),
+        "signal_values": _combine_optional_vector(
+            left_payload.get("signal_values"),
+            right_payload.get("signal_values"),
+            left_total.size,
+            right_total.size,
+        ),
+        "process_failures": list(left_payload.get("process_failures", ()))
+        + list(right_payload.get("process_failures", ())),
+        "band_failures": list(left_payload.get("band_failures", ()))
+        + list(right_payload.get("band_failures", ())),
+    }
+    return combined
+
+
+def _trim_section_spans(
+    section_spans: Optional[Sequence[Tuple[str, int, int]]],
+    trim_slice: slice,
+) -> List[Tuple[str, int, int]]:
+    if not section_spans:
+        return []
+
+    start = 0 if trim_slice.start is None else int(trim_slice.start)
+    stop = trim_slice.stop
+    if stop is None:
+        return []
+
+    trimmed: List[Tuple[str, int, int]] = []
+    for label, section_start, section_stop in section_spans:
+        clipped_start = max(int(section_start), start)
+        clipped_stop = min(int(section_stop), int(stop))
+        if clipped_stop <= clipped_start:
+            continue
+        trimmed.append((str(label), clipped_start - start, clipped_stop - start))
+    return trimmed
+
+
+def _draw_section_spans(
+    ax,
+    rax,
+    edges: np.ndarray,
+    section_spans: Sequence[Tuple[str, int, int]],
+) -> None:
+    if not section_spans:
+        return
+
+    text_transform = mpl.transforms.blended_transform_factory(ax.transData, ax.transAxes)
+    for idx, (label, start, stop) in enumerate(section_spans):
+        if idx > 0:
+            boundary = float(edges[start])
+            ax.axvline(boundary, color="#444444", lw=1.1, ls="--", alpha=0.7, zorder=4.5)
+            rax.axvline(boundary, color="#444444", lw=1.1, ls="--", alpha=0.7, zorder=4.5)
+        center = 0.5 * (float(edges[start]) + float(edges[stop]))
+        ax.text(
+            center,
+            0.965,
+            label,
+            transform=text_transform,
+            ha="center",
+            va="top",
+            fontsize=13,
+            bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "none", "pad": 1.6},
+            zorder=9,
+        )
+
+
+def _bin_widths(edges: np.ndarray) -> np.ndarray:
+    return np.diff(np.asarray(edges, dtype=float))
+
+
+def _should_normalize_by_bin_width(edges: np.ndarray) -> bool:
+    widths = _bin_widths(edges)
+    if widths.size == 0:
+        return False
+    if np.any(~np.isfinite(widths)) or np.any(widths <= 0.0):
+        return False
+    return not np.allclose(widths, widths[0], rtol=1e-9, atol=1e-12)
+
+
+def _normalize_values_by_bin_width(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    widths = _bin_widths(edges)
+    return np.asarray(values, dtype=float) / widths
+
+
+def _normalize_stack_by_bin_width(stack_values: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    widths = _bin_widths(edges)
+    stack = np.asarray(stack_values, dtype=float)
+    if stack.size == 0:
+        return stack.copy()
+    return stack / widths[np.newaxis, :]
+
+
+def _normalize_covariance_by_bin_width(covariance: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    widths = _bin_widths(edges)
+    scale = np.outer(widths, widths)
+    return np.asarray(covariance, dtype=float) / scale
+
+
+def _format_axis_tick_value(value: float) -> str:
+    return f"{float(value):.4g}"
+
+
+def _select_section_tick_values(edges: np.ndarray, max_ticks: int = 5) -> np.ndarray:
+    local_edges = np.asarray(edges, dtype=float)
+    if local_edges.size == 0:
+        return np.array([], dtype=float)
+    unique_edges = np.unique(local_edges)
+    if unique_edges.size <= max_ticks:
+        return unique_edges
+    indices = np.linspace(0, unique_edges.size - 1, num=max_ticks, dtype=int)
+    return unique_edges[np.unique(indices)]
+
+
+def _build_section_axis_ticks(
+    stitched_edges: np.ndarray,
+    section_spans: Sequence[Tuple[str, int, int]],
+    section_local_edges: Sequence[np.ndarray],
+    max_ticks_per_section: int = 5,
+) -> Tuple[np.ndarray, List[str]]:
+    positions: List[float] = []
+    labels: List[str] = []
+    stitched = np.asarray(stitched_edges, dtype=float)
+    for section_index, ((_, start, _), local_edges) in enumerate(
+        zip(section_spans, section_local_edges)
+    ):
+        local = np.asarray(local_edges, dtype=float)
+        if local.size == 0:
+            continue
+        tick_values = _select_section_tick_values(local, max_ticks=max_ticks_per_section)
+        section_origin = float(stitched[int(start)])
+        local_origin = float(local[0])
+        for tick_index, tick_value in enumerate(tick_values):
+            if section_index > 0 and tick_index == 0:
+                continue
+            positions.append(section_origin + float(tick_value - local_origin))
+            labels.append(_format_axis_tick_value(float(tick_value)))
+    return np.asarray(positions, dtype=float), labels
+
+
+def _trim_axis_ticks(
+    tick_positions: Optional[np.ndarray],
+    tick_labels: Optional[Sequence[str]],
+    edges: np.ndarray,
+) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
+    if tick_positions is None or tick_labels is None:
+        return None, None
+    positions = np.asarray(tick_positions, dtype=float)
+    labels = list(tick_labels)
+    if positions.size != len(labels):
+        raise ValueError("x_tick_positions and x_tick_labels must have the same length")
+    lo = float(edges[0]) - 1e-12
+    hi = float(edges[-1]) + 1e-12
+    keep_mask = (positions >= lo) & (positions <= hi)
+    if not np.any(keep_mask):
+        return None, None
+    kept_positions = positions[keep_mask]
+    kept_labels = [label for label, keep in zip(labels, keep_mask) if keep]
+    return kept_positions, kept_labels
+
+
+def _outfile_with_suffix(outfile: Path, suffix: str) -> Path:
+    return outfile.with_name(f"{outfile.stem}{suffix}{outfile.suffix}")
+
+
+def _plot_output_variants(outfile: Path, include_logy: bool) -> List[Tuple[Path, bool]]:
+    variants: List[Tuple[Path, bool]] = [(outfile, False)]
+    if include_logy:
+        variants.append((_outfile_with_suffix(outfile, "_logy"), True))
+    return variants
+
+
 def _poisson_errors(values: np.ndarray, cl: float = 0.682689492137) -> Tuple[np.ndarray, np.ndarray]:
     values = np.asarray(values, dtype=float)
     if values.size == 0:
@@ -598,7 +1094,7 @@ def _evaluate_process_histogram(
     process_name: str,
     workspace_shape_map: Dict[str, Dict[str, Dict[str, str]]],
     process_regex_overrides: Dict[str, str],
-) -> Tuple[np.ndarray, Optional[str]]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[str], str]:
     direct_values, direct_source = _evaluate_named_process_histogram(
         workspace,
         cat,
@@ -610,7 +1106,14 @@ def _evaluate_process_histogram(
         workspace_shape_map,
     )
     if direct_values is not None:
-        return direct_values, None
+        stat_variance, stat_source = _estimate_process_stat_variance(
+            workspace,
+            state,
+            process_name,
+            direct_values,
+            workspace_shape_map,
+        )
+        return direct_values, stat_variance, None, stat_source
 
     failures: List[str] = []
     if direct_source is not None:
@@ -628,10 +1131,11 @@ def _evaluate_process_histogram(
             )
             if not np.allclose(edges, base_edges):
                 raise AssertionError(f"Edge mismatch for process '{process_name}'")
-            return values, None
+            return values, np.clip(values, 0.0, None), None, "proxy:regex"
         except Exception as exc:
             failures.append(f"{pattern}: {exc}")
-    return np.zeros(nbins, dtype=float), " | ".join(failures)
+    zeros = np.zeros(nbins, dtype=float)
+    return zeros, zeros.copy(), " | ".join(failures), "proxy:none"
 
 
 def _build_plot_groups(states: Sequence[str]) -> Dict[str, List[str]]:
@@ -729,6 +1233,9 @@ def _plot_channel(
     data_label: str,
     signal_values: Optional[np.ndarray] = None,
     signal_label: Optional[str] = None,
+    section_spans: Optional[Sequence[Tuple[str, int, int]]] = None,
+    x_tick_positions: Optional[np.ndarray] = None,
+    x_tick_labels: Optional[Sequence[str]] = None,
 ) -> None:
     lo, hi = _trim_leading_trailing_zeros(total_values, data_values)
     if hi < lo:
@@ -743,10 +1250,39 @@ def _plot_channel(
     data_values = data_values[sl]
     if signal_values is not None:
         signal_values = signal_values[sl]
+    trimmed_section_spans = _trim_section_spans(section_spans, sl)
+    trimmed_tick_positions, trimmed_tick_labels = _trim_axis_ticks(
+        x_tick_positions,
+        x_tick_labels,
+        edges,
+    )
+
+    normalize_by_width = _should_normalize_by_bin_width(edges)
+    plot_stack_values = stack_values
+    plot_total_values = total_values
+    plot_total_errors = total_errors
+    plot_data_values = data_values
+    plot_signal_values = signal_values
+    plot_eyl = eyl = None  # placeholder for type clarity below
+    plot_eyh = eyh = None
 
     centers = 0.5 * (edges[:-1] + edges[1:])
     data_mask = data_values > 0.0
     eyl, eyh = _poisson_errors(data_values)
+    if normalize_by_width:
+        plot_stack_values = _normalize_stack_by_bin_width(stack_values, edges)
+        plot_total_values = _normalize_values_by_bin_width(total_values, edges)
+        plot_total_errors = np.sqrt(
+            np.clip(np.diag(_normalize_covariance_by_bin_width(total_covariance, edges)), 0.0, None)
+        )
+        plot_data_values = _normalize_values_by_bin_width(data_values, edges)
+        plot_eyl = _normalize_values_by_bin_width(eyl, edges)
+        plot_eyh = _normalize_values_by_bin_width(eyh, edges)
+        if signal_values is not None:
+            plot_signal_values = _normalize_values_by_bin_width(signal_values, edges)
+    else:
+        plot_eyl = eyl
+        plot_eyh = eyh
 
     fig = plt.figure(figsize=(12.0, 12.0))
     gs = plt.GridSpec(2, 1, height_ratios=[3.2, 1.2], hspace=0.05)
@@ -757,7 +1293,7 @@ def _plot_channel(
 
     if stack_values.size:
         hep.histplot(
-            stack_values,
+            plot_stack_values,
             bins=edges,
             stack=True,
             histtype="fill",
@@ -772,8 +1308,8 @@ def _plot_channel(
     _step_band(
         ax,
         edges,
-        total_values,
-        total_errors,
+        plot_total_values,
+        plot_total_errors,
         label=uncertainty_label,
         alpha=0.15,
         color="#9aa0a6",
@@ -785,7 +1321,7 @@ def _plot_channel(
 
     if signal_values is not None and np.any(np.abs(signal_values) > 0.0):
         hep.histplot(
-            signal_values,
+            plot_signal_values,
             bins=edges,
             histtype="step",
             ax=ax,
@@ -796,8 +1332,8 @@ def _plot_channel(
 
     eb_main = ax.errorbar(
         centers[data_mask],
-        data_values[data_mask],
-        yerr=[eyl[data_mask], eyh[data_mask]],
+        plot_data_values[data_mask],
+        yerr=[plot_eyl[data_mask], plot_eyh[data_mask]],
         zorder=6,
         **DATA_STYLE,
         label=data_label,
@@ -812,6 +1348,8 @@ def _plot_channel(
             eb_main[0].set_zorder(9)
     except Exception:
         pass
+
+    _draw_section_spans(ax, rax, edges, trimmed_section_spans)
 
     ax.legend(
         ncol=3,
@@ -839,8 +1377,12 @@ def _plot_channel(
     r_eyl[point_mask] = eyl[point_mask] / total_values[point_mask]
     r_eyh[point_mask] = eyh[point_mask] / total_values[point_mask]
 
-    ratio_band = np.zeros_like(total_values, dtype=float)
-    ratio_band[denom_mask] = total_errors[denom_mask] / total_values[denom_mask]
+    ratio_band = _ratio_band_width(
+        total_values,
+        total_covariance,
+        data_values=data_values,
+        include_data_stat=True,
+    )
     _step_band(
         rax,
         edges,
@@ -865,10 +1407,13 @@ def _plot_channel(
         capsize=0.0,
     )
 
-    ax.set_ylabel("Events")
+    ax.set_ylabel("Events / bin width" if normalize_by_width else "Events")
     rax.set_ylabel("Data/Exp")
     rax.set_xlabel(xlabel)
     rax.set_ylim(0.5, 1.5)
+    if trimmed_tick_positions is not None and trimmed_tick_labels is not None:
+        rax.set_xticks(trimmed_tick_positions)
+        rax.set_xticklabels(trimmed_tick_labels)
     plt.setp(ax.get_xticklabels(), visible=False)
 
     outfile.parent.mkdir(parents=True, exist_ok=True)
@@ -969,7 +1514,7 @@ def main() -> None:
     parser.add_argument(
         "--nuisance-exclude-regex",
         default=DEFAULT_AUTOMCSTAT_REGEX,
-        help="Regex for nuisances to exclude from the propagated band",
+        help="Regex for nuisances to exclude from the correlated propagated band",
     )
     parser.add_argument(
         "--strict-nuisance-check",
@@ -999,7 +1544,11 @@ def main() -> None:
         help="Display-only scale factor for the signal overlay",
     )
     parser.add_argument("--cms-text", default="Preliminary", help="CMS label text")
-    parser.add_argument("--logy", action="store_true", help="Use log scale on the main pad")
+    parser.add_argument(
+        "--logy",
+        action="store_true",
+        help="Also save a log-scale companion plot in addition to the default linear plot",
+    )
     parser.add_argument(
         "--bkg-keys",
         default=",".join(DEFAULT_BKG_KEYS),
@@ -1184,6 +1733,7 @@ def main() -> None:
     print(f"[info] nuisance summary      : {summary_path}")
     component_summary_path = outdir_mode / "component_summary.json"
     component_summary: Dict[str, object] = {}
+    group_plot_payloads: Dict[str, Dict[str, object]] = {}
     workspace_shape_map = _discover_workspace_shape_processes(workspace, states)
     workspace_process_map = {
         state: tuple(sorted(values.keys())) for state, values in workspace_shape_map.items()
@@ -1286,7 +1836,9 @@ def main() -> None:
             if not xlabel:
                 xlabel = obs.GetName()
             group_process_sums = None
+            group_process_stat_variances = None
             process_failures: List[str] = []
+            stat_source_counts: Dict[str, int] = {}
 
             for state_index, state in enumerate(group_states, start=1):
                 print(f"[info] {group_name}: nominal {state_index}/{len(group_states)} -> {state}")
@@ -1305,6 +1857,9 @@ def main() -> None:
                     group_process_sums = {
                         proc: np.zeros(nbins, dtype=float) for proc in required_processes
                     }
+                    group_process_stat_variances = {
+                        proc: np.zeros(nbins, dtype=float) for proc in required_processes
+                    }
                 else:
                     if not np.allclose(group_edges, state_edges):
                         raise RuntimeError(
@@ -1319,7 +1874,7 @@ def main() -> None:
                 for process_name in required_processes:
                     if process_name not in state_available_processes:
                         continue
-                    values, failure = _evaluate_process_histogram(
+                    values, stat_variance, failure, stat_source = _evaluate_process_histogram(
                         workspace,
                         pdf,
                         data,
@@ -1333,11 +1888,17 @@ def main() -> None:
                         process_regex_overrides,
                     )
                     group_process_sums[process_name] += values
+                    if group_process_stat_variances is not None:
+                        group_process_stat_variances[process_name] += stat_variance
+                    stat_source_counts[stat_source] = stat_source_counts.get(stat_source, 0) + 1
                     if failure is not None:
                         process_failures.append(f"{state}/{process_name}: {failure}")
 
-                state_plot_edges, state_xlabel = _resolve_plot_axis(
-                    np.asarray(state_edges, dtype=float),
+                lo, hi = _trim_leading_trailing_zeros(state_total_values, state_data_values)
+                active_state_edges = state_edges[lo : hi + 2]
+
+                active_plot_edges, state_xlabel = _resolve_plot_axis(
+                    np.asarray(active_state_edges, dtype=float),
                     analysis_dir,
                     config_path,
                     state,
@@ -1346,6 +1907,16 @@ def main() -> None:
                     xaxis_label=args.xaxis_label,
                     fallback_xlabel=xlabel,
                 )
+
+                state_plot_edges = np.arange(len(state_edges), dtype=float)
+                if len(active_plot_edges) == hi - lo + 2:
+                    state_plot_edges[lo : hi + 2] = active_plot_edges
+                    if lo > 0:
+                        state_plot_edges[:lo] = active_plot_edges[0] - np.arange(lo, 0, -1)
+                    if hi + 2 < len(state_plot_edges):
+                        state_plot_edges[hi + 2:] = active_plot_edges[-1] + np.arange(1, len(state_plot_edges) - (hi + 2) + 1)
+                else:
+                    state_plot_edges = np.asarray(state_edges, dtype=float)
 
                 if plot_edges is None:
                     plot_edges = state_plot_edges
@@ -1380,6 +1951,19 @@ def main() -> None:
                 band_errors,
                 correlation,
             )
+            group_mcstat_variance = np.zeros(len(group_edges) - 1, dtype=float)
+            if group_process_stat_variances is not None:
+                for values in group_process_stat_variances.values():
+                    group_mcstat_variance += np.asarray(values, dtype=float)
+            group_covariance = group_covariance + np.diag(np.clip(group_mcstat_variance, 0.0, None))
+            if stat_source_counts:
+                counts_text = ", ".join(
+                    f"{key}={stat_source_counts[key]}" for key in sorted(stat_source_counts)
+                )
+                print(
+                    f"[info] {group_name}: decorrelated autoMCStats term added "
+                    f"({counts_text})"
+                )
 
             stack_values: List[np.ndarray] = []
             for sources in source_lists:
@@ -1511,26 +2095,135 @@ def main() -> None:
             data_label = _display_label(legend_label_map, "Data", "data")
 
             outfile = outdir_mode / f"{mode}_{group_name}.png"
-            _plot_channel(
-                channel=group_name,
-                mode=mode,
-                xlabel=xlabel,
-                edges=edges,
-                stack_values=stack_array,
-                stack_labels=stack_labels,
-                stack_display_labels=display_stack_labels,
-                total_values=total_values,
-                total_covariance=group_covariance,
-                data_values=data_values,
-                cms_text=args.cms_text,
-                lumi_text=LUMI_MAP["Run2"],
-                logy=args.logy,
-                outfile=outfile,
-                uncertainty_label=uncertainty_label,
-                data_label=data_label,
-                signal_values=signal_overlay,
-                signal_label=signal_label,
+            for plot_outfile, plot_logy in _plot_output_variants(outfile, args.logy):
+                _plot_channel(
+                    channel=group_name,
+                    mode=mode,
+                    xlabel=xlabel,
+                    edges=edges,
+                    stack_values=stack_array,
+                    stack_labels=stack_labels,
+                    stack_display_labels=display_stack_labels,
+                    total_values=total_values,
+                    total_covariance=group_covariance,
+                    data_values=data_values,
+                    cms_text=args.cms_text,
+                    lumi_text=LUMI_MAP["Run2"],
+                    logy=plot_logy,
+                    outfile=plot_outfile,
+                    uncertainty_label=uncertainty_label,
+                    data_label=data_label,
+                    signal_values=signal_overlay,
+                    signal_label=signal_label,
+                )
+            group_plot_payloads[group_name] = {
+                "xlabel": xlabel,
+                "edges": np.asarray(edges, dtype=float),
+                "stack_labels": tuple(stack_labels),
+                "stack_array": np.asarray(stack_array, dtype=float),
+                "total_values": np.asarray(total_values, dtype=float),
+                "data_values": np.asarray(data_values, dtype=float),
+                "covariance": np.asarray(group_covariance, dtype=float),
+                "signal_values": (
+                    np.asarray(signal_overlay, dtype=float)
+                    if signal_overlay is not None
+                    else None
+                ),
+                "component_signal_values": (
+                    np.asarray(signal_values, dtype=float)
+                    if signal_values is not None
+                    else None
+                ),
+                "signal_label": signal_label,
+                "uncertainty_label": uncertainty_label,
+                "data_label": data_label,
+            }
+
+        if "SL" in group_plot_payloads and "SR" in group_plot_payloads:
+            combined_stack_labels = _resolve_combined_stack_labels(
+                bkg_keys,
+                group_plot_payloads["SL"]["stack_labels"],
+                group_plot_payloads["SR"]["stack_labels"],
             )
+            combined_payload = _combine_group_payloads(
+                group_plot_payloads["SL"],
+                group_plot_payloads["SR"],
+                combined_stack_labels,
+            )
+            combined_component_signal = _combine_optional_vector(
+                group_plot_payloads["SL"].get("component_signal_values"),
+                group_plot_payloads["SR"].get("component_signal_values"),
+                len(group_plot_payloads["SL"]["total_values"]),
+                len(group_plot_payloads["SR"]["total_values"]),
+            )
+            combined_component_sum = (
+                np.sum(np.asarray(combined_payload["stack_array"], dtype=float), axis=0)
+                if np.asarray(combined_payload["stack_array"]).size
+                else np.zeros_like(np.asarray(combined_payload["total_values"], dtype=float))
+            )
+            if combined_component_signal is not None:
+                combined_component_sum = combined_component_sum + combined_component_signal
+            combined_residual = (
+                np.asarray(combined_payload["total_values"], dtype=float) - combined_component_sum
+            )
+            component_summary[SL_SR_COMBINED_GROUP] = _summarize_group_components(
+                SL_SR_COMBINED_GROUP,
+                combined_stack_labels,
+                np.asarray(combined_payload["stack_array"], dtype=float),
+                np.asarray(combined_payload["total_values"], dtype=float),
+                combined_component_signal,
+                args.signal_key,
+                combined_residual,
+            )
+            with component_summary_path.open("w", encoding="utf-8") as handle:
+                json.dump(component_summary, handle, indent=2, ensure_ascii=False)
+
+            sl_nbins = len(group_plot_payloads["SL"]["total_values"])
+            sr_nbins = len(group_plot_payloads["SR"]["total_values"])
+            combined_section_spans = (
+                ("SL CR", 0, sl_nbins),
+                ("SR", sl_nbins, sl_nbins + sr_nbins),
+            )
+            combined_tick_positions, combined_tick_labels = _build_section_axis_ticks(
+                np.asarray(combined_payload["edges"], dtype=float),
+                combined_section_spans,
+                (
+                    np.asarray(group_plot_payloads["SL"]["edges"], dtype=float),
+                    np.asarray(group_plot_payloads["SR"]["edges"], dtype=float),
+                ),
+            )
+            display_stack_labels = tuple(
+                _display_label(legend_label_map, label, label)
+                for label in combined_stack_labels
+            )
+            combined_signal_label = group_plot_payloads["SL"].get("signal_label")
+            if combined_signal_label is None:
+                combined_signal_label = group_plot_payloads["SR"].get("signal_label")
+            outfile = outdir_mode / f"{mode}_{SL_SR_COMBINED_GROUP}.png"
+            for plot_outfile, plot_logy in _plot_output_variants(outfile, args.logy):
+                _plot_channel(
+                    channel=SL_SR_COMBINED_GROUP,
+                    mode=mode,
+                    xlabel=str(combined_payload["xlabel"]),
+                    edges=np.asarray(combined_payload["edges"], dtype=float),
+                    stack_values=np.asarray(combined_payload["stack_array"], dtype=float),
+                    stack_labels=combined_stack_labels,
+                    stack_display_labels=display_stack_labels,
+                    total_values=np.asarray(combined_payload["total_values"], dtype=float),
+                    total_covariance=np.asarray(combined_payload["covariance"], dtype=float),
+                    data_values=np.asarray(combined_payload["data_values"], dtype=float),
+                    cms_text=args.cms_text,
+                    lumi_text=LUMI_MAP["Run2"],
+                    logy=plot_logy,
+                    outfile=plot_outfile,
+                    uncertainty_label=str(group_plot_payloads["SL"]["uncertainty_label"]),
+                    data_label=str(group_plot_payloads["SL"]["data_label"]),
+                    signal_values=combined_payload.get("signal_values"),
+                    signal_label=combined_signal_label,
+                    section_spans=combined_section_spans,
+                    x_tick_positions=combined_tick_positions,
+                    x_tick_labels=combined_tick_labels,
+                )
         print(f"[info] component summary    : {component_summary_path}")
     finally:
         try:
